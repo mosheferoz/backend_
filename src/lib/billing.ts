@@ -134,6 +134,27 @@ export async function activatePaidSubscription(i: {
   if (error) throw new Error(`activatePaidSubscription: ${error.message}`);
 }
 
+/** TEMP: grant access to a tester without payment (no card, no auto-renew). */
+export async function grantTesterAccess(userId: string, plan: PaidPlan, days = 365): Promise<void> {
+  const now = new Date();
+  const { error } = await supabaseAdmin
+    .from("subscriptions")
+    .update({
+      plan,
+      status: "active",
+      purchased_at: iso(now),
+      expires_at: iso(addDays(now, days)),
+      next_billing_at: null,
+      auto_renew: false,
+      cancel_at_period_end: false,
+      failed_charge_count: 0,
+      dunning_status: "tester",
+      updated_at: iso(now),
+    })
+    .eq("user_id", userId);
+  if (error) throw new Error(`grantTesterAccess: ${error.message}`);
+}
+
 /** Renewal success — extend the period; clear dunning state. */
 export async function renewSubscription(userId: string, sum: number): Promise<void> {
   const now = new Date();

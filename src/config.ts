@@ -31,6 +31,9 @@ const EnvSchema = z.object({
   CRON_SECRET: z.string().min(8),
   // 32-byte key (base64) for AES-256-GCM encryption of card tokens at rest.
   TOKEN_ENC_KEY: z.string().min(44),
+  // TEMP tester bypass: when set, /api/redeem-code grants access without Grow.
+  // Leave empty to disable the feature entirely.
+  TESTER_CODE: z.string().optional().default(""),
 });
 
 const parsed = EnvSchema.safeParse(process.env);
@@ -77,6 +80,7 @@ export const config = {
   growNotifySecret: env.GROW_NOTIFY_SECRET,
   cronSecret: env.CRON_SECRET,
   tokenEncKey: env.TOKEN_ENC_KEY,
+  testerCode: env.TESTER_CODE,
 } as const;
 
 export type AppConfig = typeof config;
