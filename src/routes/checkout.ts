@@ -56,6 +56,10 @@ checkoutRoute.post("/", async (c) => {
   });
 
   const price = priceFor(plan);
+  // Trial = save the card without charging (chargeType=3). Grow rejects sum=0,
+  // so we show a ₪1 reference on the token-save page; the real ₪price is charged
+  // at trial end via createTransactionWithToken.
+  const sum = mode === "trial" ? 1 : price;
   const description =
     mode === "trial"
       ? `התחלת ניסיון — מסלול ${PLAN_LABELS[plan]} (קונטרול בקליק)`
@@ -63,7 +67,7 @@ checkoutRoute.post("/", async (c) => {
 
   const res = await grow.createPaymentProcess({
     chargeType: mode === "trial" ? ChargeType.SAVE_TOKEN_ONLY : ChargeType.SUBSCRIBE,
-    sum: price,
+    sum,
     description,
     fullName: contact.fullName,
     phone,
