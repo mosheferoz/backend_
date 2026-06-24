@@ -47,7 +47,9 @@ export async function runRenewals(): Promise<RenewalSummary> {
         continue;
       }
 
-      const amount = priceFor(sub.plan);
+      // Promo price for the first 3 paid charges, regular from the 4th.
+      const cycle = await billing.nextChargeCycle(sub.userId);
+      const amount = priceFor(sub.plan, cycle);
       uniqueId = await billing.nextUniqueId();
       const contact = await billing.getProfileBillingContact(sub.userId);
 

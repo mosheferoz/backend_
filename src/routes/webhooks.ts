@@ -158,7 +158,9 @@ webhooksRoute.post("/", async (c) => {
     verifiedSum = Number(pick(d, ["sum", "paymentSum"]));
   }
 
-  if (!amountMatches(plan as PaidPlan, verifiedSum)) {
+  // Validate against the price for this user's current cycle (promo vs regular).
+  const cycle = await billing.nextChargeCycle(userId);
+  if (!amountMatches(plan as PaidPlan, verifiedSum, cycle)) {
     await billing.recordPayment({
       userId,
       plan,

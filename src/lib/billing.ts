@@ -135,7 +135,11 @@ export async function activatePaidSubscription(i: {
 }
 
 /** TEMP: grant access to a tester without payment (no card, no auto-renew). */
-export async function grantTesterAccess(userId: string, plan: PaidPlan, days = 365): Promise<void> {
+export async function grantTesterAccess(
+  userId: string,
+  plan: PaidPlan,
+  expiresAt: Date,
+): Promise<void> {
   const now = new Date();
   const { error } = await supabaseAdmin
     .from("subscriptions")
@@ -143,7 +147,7 @@ export async function grantTesterAccess(userId: string, plan: PaidPlan, days = 3
       plan,
       status: "active",
       purchased_at: iso(now),
-      expires_at: iso(addDays(now, days)),
+      expires_at: iso(expiresAt),
       next_billing_at: null,
       auto_renew: false,
       cancel_at_period_end: false,
@@ -313,6 +317,34 @@ export async function recordPayment(i: RecordPaymentInput): Promise<{ deduped: b
     throw new Error(`recordPayment: ${error.message}`);
   }
   return { deduped: false };
+}
+
+/**
+ * Count the user's successful PAID charges so far (excludes the ₪0 trial and
+ * refunds). Used to determine the promo-vs-regular price of the next charge.
+ */
+export async function countPaidCharges(userId: string): Promise<number> {
+  const { count, error } = await supabaseAdmin
+    .from("subscription_payments")
+    .select("id", { count: "exact", head: true })
+    .eq("user_id", userId)
+    .eq("status", "success")
+    .in("kind", ["subscribe", "renewal"])
+    .gt("amount", 0); // exclude ₪0 tester grants / trials
+  if (error) {
+    logger.error({ err: error.message, userId }, "count_paid_charges_failed");
+    return 0;
+  }
+  return count ?? 0;
+}
+
+/**
+ * The 1-based billing cycle of the NEXT charge for this user: one more than the
+ * number of successful paid charges already made. Cycle 1 is the first paid
+ * charge (promo). Pass to priceFor()/amountMatches().
+ */
+export async function nextChargeCycle(userId: string): Promise<number> {
+  return (await countPaidCharges(userId)) + 1;
 }
 
 /** Finalize a previously-recorded pending payment (renewal) to success/failed. */

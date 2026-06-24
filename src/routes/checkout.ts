@@ -4,7 +4,7 @@ import { requireAuth, type AppEnv } from "../lib/auth.js";
 import { rateLimit } from "../lib/rateLimit.js";
 import { grow, ChargeType, isGrowSuccess } from "../lib/grow.js";
 import { priceFor, PLAN_LABELS } from "../lib/plans.js";
-import { recordConsent, getProfileBillingContact } from "../lib/billing.js";
+import { recordConsent, getProfileBillingContact, nextChargeCycle } from "../lib/billing.js";
 import { supabaseAdmin } from "../lib/supabaseAdmin.js";
 import { isValidILMobile, normalizeILPhone } from "../lib/phone.js";
 import { growNotifyUrl, growInvoiceNotifyUrl, successUrl, cancelUrl } from "../lib/urls.js";
@@ -55,7 +55,9 @@ checkoutRoute.post("/", async (c) => {
     userAgent: c.req.header("user-agent") ?? null,
   });
 
-  const price = priceFor(plan);
+  // Promo price for the first 3 paid charges, regular afterwards (re-subscribe).
+  const cycle = await nextChargeCycle(user.id);
+  const price = priceFor(plan, cycle);
   // Trial = save the card without charging (chargeType=3). Grow rejects sum=0,
   // so we show a ₪1 reference on the token-save page; the real ₪price is charged
   // at trial end via createTransactionWithToken.
