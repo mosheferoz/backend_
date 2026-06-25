@@ -47,16 +47,21 @@ export async function runRenewals(): Promise<RenewalSummary> {
         continue;
       }
 
+      // A scheduled downgrade takes effect on this renewal: bill the new plan
+      // and switch to it atomically on success.
+      const effectivePlan = sub.pendingPlan ?? sub.plan;
+      const planSwitch = sub.pendingPlan && sub.pendingPlan !== sub.plan ? sub.pendingPlan : undefined;
+
       // Promo price for the first 3 paid charges, regular from the 4th.
       const cycle = await billing.nextChargeCycle(sub.userId);
-      const amount = priceFor(sub.plan, cycle);
+      const amount = priceFor(effectivePlan, cycle);
       uniqueId = await billing.nextUniqueId();
       const contact = await billing.getProfileBillingContact(sub.userId);
 
       // Trace before charging — reconcile resolves any 'pending' left behind.
       await billing.recordPayment({
         userId: sub.userId,
-        plan: sub.plan,
+        plan: effectivePlan,
         amount,
         transactionUniqueId: uniqueId,
         transactionGroupId: sub.billingGroupId,
@@ -67,7 +72,7 @@ export async function runRenewals(): Promise<RenewalSummary> {
       const res = await grow.createTransactionWithToken({
         cardToken: pm.token,
         sum: amount,
-        description: `חידוש מנוי ${PLAN_LABELS[sub.plan]} — קונטרול בקליק`,
+        description: `חידוש מנוי ${PLAN_LABELS[effectivePlan]} — קונטרול בקליק`,
         fullName: contact.fullName,
         phone: contact.phone,
         email: contact.email ?? undefined,
@@ -75,13 +80,13 @@ export async function runRenewals(): Promise<RenewalSummary> {
         transactionGroupIdentifier: sub.billingGroupId,
         invoiceNotifyUrl: growInvoiceNotifyUrl(),
         cField1: sub.userId,
-        cField2: sub.plan,
+        cField2: effectivePlan,
         cField3: "renewal",
       });
 
       if (isGrowSuccess(res)) {
         const dd = (res.data ?? {}) as Record<string, unknown>;
-        await billing.renewSubscription(sub.userId, amount);
+        await billing.renewSubscription(sub.userId, amount, planSwitch);
         await billing.incrementChargeCount(sub.userId);
         await billing.finalizePayment(uniqueId, {
           status: "success",
@@ -98,7 +103,7 @@ export async function runRenewals(): Promise<RenewalSummary> {
           transactionUniqueIdentifier: uniqueId,
         });
         if (tokenQueryIndicatesPaid(q)) {
-          await billing.renewSubscription(sub.userId, amount);
+          await billing.renewSubscription(sub.userId, amount, planSwitch);
           await billing.incrementChargeCount(sub.userId);
           await billing.finalizePayment(uniqueId, { status: "success" });
           succeeded++;

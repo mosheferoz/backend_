@@ -1,16 +1,178 @@
 import { Hono } from "hono";
+import { z } from "zod";
 import { requireAuth, type AppEnv } from "../lib/auth.js";
 import { rateLimit } from "../lib/rateLimit.js";
 import { grow, ChargeType, isGrowSuccess } from "../lib/grow.js";
-import { isPaidPlan, priceFor, PLAN_LABELS } from "../lib/plans.js";
+import {
+  isPaidPlan,
+  priceFor,
+  prorationDelta,
+  PLAN_LABELS,
+  MAX_TOKEN_CHARGES,
+  type PaidPlan,
+} from "../lib/plans.js";
+import * as billing from "../lib/billing.js";
 import { setCancelAtPeriodEnd, getProfileBillingContact } from "../lib/billing.js";
 import { supabaseAdmin } from "../lib/supabaseAdmin.js";
 import { growNotifyUrl, growInvoiceNotifyUrl, successUrl, cancelUrl } from "../lib/urls.js";
+import { logger } from "../lib/logger.js";
 
 export const subscriptionRoute = new Hono<AppEnv>();
 
 subscriptionRoute.use("*", rateLimit({ windowMs: 60_000, max: 20, keyPrefix: "sub" }));
 subscriptionRoute.use("*", requireAuth);
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+const ChangePlanBody = z.object({ plan: z.enum(["premium", "pro"]) });
+
+/**
+ * Change the active plan. Industry-standard behavior:
+ *   - During trial: switch immediately, no charge (the first charge at trial
+ *     end uses the new plan).
+ *   - Upgrade (active, paid): take effect immediately and charge ONLY the
+ *     prorated price difference for the unused part of the current period; the
+ *     billing anchor (next_billing_at) is preserved.
+ *   - Downgrade (active, paid): scheduled to the end of the current period
+ *     (pending_plan), no immediate charge and no refund.
+ */
+subscriptionRoute.post("/change-plan", async (c) => {
+  const parsed = ChangePlanBody.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) return c.json({ ok: false, error: "invalid_request" }, 400);
+  const target = parsed.data.plan as PaidPlan;
+  const user = c.get("user");
+
+  const { data: sub } = await supabaseAdmin
+    .from("subscriptions")
+    .select("plan, pending_plan, status, next_billing_at, cancel_at_period_end")
+    .eq("user_id", user.id)
+    .maybeSingle();
+
+  if (!sub) return c.json({ ok: false, error: "no_subscription" }, 404);
+  const current = sub.plan as string;
+  const status = sub.status as string;
+
+  // "Upgrade back" / no-op: user is already on the target plan.
+  if (current === target) {
+    if (sub.pending_plan) {
+      await billing.clearPendingPlan(user.id);
+      return c.json({ ok: true, effect: "pending_cleared" });
+    }
+    return c.json({ ok: false, error: "same_plan" }, 400);
+  }
+
+  if (status !== "active" && status !== "trialing") {
+    return c.json({ ok: false, error: "update_card_required" }, 409);
+  }
+  if (!isPaidPlan(current)) {
+    return c.json({ ok: false, error: "no_paid_plan" }, 400);
+  }
+
+  const cycle = Math.max(await billing.countPaidCharges(user.id), 1);
+  const isUpgrade = priceFor(target, cycle) > priceFor(current, cycle);
+
+  // --- trial: switch immediately, no charge ---
+  if (status === "trialing") {
+    await billing.changePlanImmediate(user.id, target);
+    logger.info({ userId: user.id, from: current, to: target }, "plan_change_trial");
+    return c.json({ ok: true, effect: "immediate_trial" });
+  }
+
+  // --- downgrade (active): schedule to period end ---
+  if (!isUpgrade) {
+    if (sub.cancel_at_period_end) {
+      return c.json({ ok: false, error: "cancellation_pending" }, 409);
+    }
+    await billing.schedulePlanChange(user.id, target);
+    logger.info({ userId: user.id, from: current, to: target }, "plan_change_scheduled");
+    return c.json({ ok: true, effect: "scheduled_period_end", effectiveAt: sub.next_billing_at });
+  }
+
+  // --- upgrade (active): immediate, prorated charge ---
+  const nextBilling = sub.next_billing_at ? new Date(sub.next_billing_at as string) : null;
+  if (!nextBilling) return c.json({ ok: false, error: "no_billing_anchor" }, 409);
+  const now = new Date();
+  const daysRemaining = (nextBilling.getTime() - now.getTime()) / DAY_MS;
+  if (daysRemaining < 1) {
+    // Renewal is imminent — let it bill the new plan at full price instead of a
+    // near-zero proration followed immediately by a full charge.
+    return c.json({ ok: false, error: "renewal_in_progress" }, 409);
+  }
+  const periodStart = new Date(nextBilling);
+  periodStart.setMonth(periodStart.getMonth() - 1);
+  const daysInPeriod = (nextBilling.getTime() - periodStart.getTime()) / DAY_MS;
+
+  const pm = await billing.getPaymentMethod(user.id);
+  if (!pm || !pm.isValid || !pm.token) {
+    return c.json({ ok: false, error: "no_card" }, 409);
+  }
+  if (pm.chargeCount >= MAX_TOKEN_CHARGES) {
+    return c.json({ ok: false, error: "token_charge_limit" }, 409);
+  }
+
+  const amount = prorationDelta(current, target, cycle, daysRemaining, daysInPeriod);
+  if (amount <= 0) {
+    // Nothing to charge (e.g. already at period boundary): just switch.
+    await billing.applyUpgrade(user.id, target);
+    return c.json({ ok: true, effect: "immediate_no_charge" });
+  }
+
+  // Serialize against the renewal job and concurrent upgrades.
+  if (!(await billing.claimForUpgrade(user.id))) {
+    return c.json({ ok: false, error: "renewal_in_progress" }, 409);
+  }
+
+  const uniqueId = await billing.nextUniqueId();
+  const contact = await billing.getProfileBillingContact(user.id);
+  const description = `שדרוג מסלול ${PLAN_LABELS[current as PaidPlan]} → ${PLAN_LABELS[target]} (חיוב יחסי) — קונטרול בקליק`;
+
+  // Trace before charging — reconcile resolves any 'pending' left behind.
+  await billing.recordPayment({
+    userId: user.id,
+    plan: target,
+    amount,
+    transactionUniqueId: uniqueId,
+    kind: "upgrade",
+    status: "pending",
+  });
+
+  const res = await grow.createTransactionWithToken({
+    cardToken: pm.token,
+    sum: amount,
+    description,
+    fullName: contact.fullName,
+    phone: contact.phone,
+    email: contact.email ?? undefined,
+    transactionUniqueIdentifier: uniqueId,
+    invoiceNotifyUrl: growInvoiceNotifyUrl(),
+    cField1: user.id,
+    cField2: target,
+    cField3: "upgrade",
+  });
+
+  if (isGrowSuccess(res)) {
+    const dd = (res.data ?? {}) as Record<string, unknown>;
+    await billing.applyUpgrade(user.id, target);
+    await billing.incrementChargeCount(user.id);
+    await billing.finalizePayment(uniqueId, {
+      status: "success",
+      providerTxnId: dd.transactionId ? String(dd.transactionId) : null,
+      asmachta: dd.asmachta ? String(dd.asmachta) : null,
+      cardSuffix: (dd.cardSuffix as string) ?? pm.cardSuffix,
+      cardBrand: (dd.cardBrand as string) ?? null,
+    });
+    logger.info({ userId: user.id, from: current, to: target, amount }, "plan_upgrade_charged");
+    return c.json({ ok: true, effect: "upgraded", proratedAmount: amount });
+  }
+
+  // Upgrade charge failed — leave the plan untouched, NO dunning.
+  await billing.finalizePayment(uniqueId, {
+    status: "failed",
+    errorText: res.err?.message ?? "upgrade_charge_failed",
+  });
+  logger.warn({ userId: user.id, target, err: res.err }, "plan_upgrade_failed");
+  return c.json({ ok: false, error: "charge_failed" }, 502);
+});
 
 subscriptionRoute.post("/cancel", async (c) => {
   await setCancelAtPeriodEnd(c.get("user").id, true);

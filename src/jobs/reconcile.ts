@@ -19,9 +19,9 @@ export async function runReconcile(): Promise<ReconcileSummary> {
   const cutoff = new Date(Date.now() - 10 * 60_000).toISOString();
   const { data, error } = await supabaseAdmin
     .from("subscription_payments")
-    .select("user_id, plan, amount, transaction_unique_id")
+    .select("user_id, plan, amount, transaction_unique_id, kind")
     .eq("status", "pending")
-    .eq("kind", "renewal")
+    .in("kind", ["renewal", "upgrade"])
     .lt("created_at", cutoff)
     .limit(100);
   if (error) throw new Error(`reconcile: ${error.message}`);
@@ -32,6 +32,8 @@ export async function runReconcile(): Promise<ReconcileSummary> {
   for (const p of (data ?? []) as Array<Record<string, unknown>>) {
     const userId = String(p.user_id);
     const uniqueId = p.transaction_unique_id as number | null;
+    const kind = String(p.kind);
+    const plan = p.plan as PaidPlan;
     try {
       const pm = await billing.getPaymentMethod(userId);
       if (!pm || !pm.token || uniqueId == null) {
@@ -46,14 +48,24 @@ export async function runReconcile(): Promise<ReconcileSummary> {
         transactionUniqueIdentifier: uniqueId,
       });
       if (tokenQueryIndicatesPaid(q)) {
-        const amount = (p.amount as number) ?? priceFor(p.plan as PaidPlan);
-        await billing.renewSubscription(userId, amount);
+        const amount = (p.amount as number) ?? priceFor(plan);
+        if (kind === "upgrade") {
+          // A prorated upgrade charge went through — apply the plan switch.
+          await billing.applyUpgrade(userId, plan);
+        } else {
+          // Renewal: extend the period; `plan` carries any scheduled downgrade.
+          await billing.renewSubscription(userId, amount, plan);
+        }
         await billing.incrementChargeCount(userId);
         await billing.finalizePayment(uniqueId, { status: "success" });
         renewed++;
       } else {
         await billing.finalizePayment(uniqueId, { status: "failed", errorText: "reconcile_not_found" });
-        await billing.recordRenewalFailure(userId, "reconcile_not_found", false);
+        // A failed renewal enters dunning; a failed upgrade must NOT — the
+        // existing subscription is untouched.
+        if (kind === "renewal") {
+          await billing.recordRenewalFailure(userId, "reconcile_not_found", false);
+        }
         failed++;
       }
     } catch (e) {

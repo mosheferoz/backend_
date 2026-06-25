@@ -33,6 +33,21 @@ checkoutRoute.post("/", async (c) => {
   const { plan, mode, invoiceName, invoiceLicenseNumber } = parsed.data;
   const user = c.get("user");
 
+  // Guard against a duplicate charge: an active/trial paid subscriber must use
+  // the change-plan flow, not a fresh checkout (which would charge again and
+  // reset the billing period). Lapsed (free) and past_due users may re-checkout.
+  const { data: existing } = await supabaseAdmin
+    .from("subscriptions")
+    .select("plan, status")
+    .eq("user_id", user.id)
+    .maybeSingle();
+  if (
+    (existing?.status === "active" || existing?.status === "trialing") &&
+    (existing?.plan === "premium" || existing?.plan === "pro")
+  ) {
+    return c.json({ ok: false, error: "already_subscribed" }, 409);
+  }
+
   const contact = await getProfileBillingContact(user.id);
 
   // Grow requires a valid Israeli phone (else err 946). Prefer a phone supplied

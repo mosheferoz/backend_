@@ -9,7 +9,6 @@ import { checkoutRoute } from "./routes/checkout.js";
 import { webhooksRoute } from "./routes/webhooks.js";
 import { subscriptionRoute } from "./routes/subscription.js";
 import { internalRoute } from "./routes/internal.js";
-import { redeemRoute } from "./routes/redeem.js";
 import { startScheduler } from "./jobs/scheduler.js";
 
 const app = new Hono();
@@ -36,7 +35,6 @@ app.get("/", (c) => c.text("controlclick billing server"));
 app.route("/api/checkout", checkoutRoute);
 app.route("/webhook", webhooksRoute); // public Grow notify (registered with Grow)
 app.route("/api/subscription", subscriptionRoute);
-app.route("/api/redeem-code", redeemRoute); // TEMP tester bypass
 app.route("/internal", internalRoute);
 
 app.notFound((c) => c.json({ ok: false, error: "not_found" }, 404));

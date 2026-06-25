@@ -2,13 +2,18 @@
 export type PaidPlan = "premium" | "pro";
 
 export interface PlanPricing {
-  /** Promo price (shekels, excl. VAT) for the first PROMO_CHARGES paid cycles. */
+  /** Promo price (shekels, VAT-included) for the first PROMO_CHARGES paid cycles. */
   promo: number;
   /** Regular price from the (PROMO_CHARGES + 1)th charge onward. */
   regular: number;
 }
 
-/** Monthly price per tier, in shekels (excl. VAT). */
+/**
+ * Monthly price per tier, in shekels, VAT-INCLUDED. These are the final amounts
+ * charged and displayed to the customer; no VAT is added on top anywhere in the
+ * billing path. The Grow account must be configured to issue VAT-inclusive
+ * invoices for these sums (no extra 18% added).
+ */
 export const PLAN_PRICING: Record<PaidPlan, PlanPricing> = {
   premium: { promo: 49, regular: 149 },
   pro: { promo: 99, regular: 249 },
@@ -55,5 +60,38 @@ export function amountMatches(
   cycleNumber = 1,
 ): boolean {
   if (sum == null || Number.isNaN(sum)) return false;
-  return sum >= priceFor(plan, cycleNumber) - 0.5;
+  const expected = priceFor(plan, cycleNumber);
+  // Lower bound: anti-tampering (no spoofed low amount). Upper bound: catch a
+  // silent overcharge (e.g. VAT mistakenly added on top). Allow ₪0.5 rounding
+  // and any legitimate higher tier (regular > promo) — but not an unbounded sum.
+  return sum >= expected - 0.5 && sum <= PLAN_PRICING[plan].regular + 0.5;
+}
+
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
+}
+
+function clamp(n: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, n));
+}
+
+/**
+ * Prorated charge for an immediate mid-cycle upgrade: the price difference
+ * between the new and old plan for the CURRENT cycle, scaled by the unused
+ * fraction of the current paid period. Uses priceFor() so it stays in lockstep
+ * with renewals (and with the VAT-inclusive prices). Returns a non-negative,
+ * 2-decimal shekel amount; 0 when there is nothing left to prorate.
+ */
+export function prorationDelta(
+  fromPlan: PaidPlan,
+  toPlan: PaidPlan,
+  cycleNumber: number,
+  daysRemaining: number,
+  daysInPeriod: number,
+): number {
+  if (daysInPeriod <= 0) return 0;
+  const fullDelta = priceFor(toPlan, cycleNumber) - priceFor(fromPlan, cycleNumber);
+  if (fullDelta <= 0) return 0;
+  const ratio = clamp(daysRemaining / daysInPeriod, 0, 1);
+  return round2(fullDelta * ratio);
 }

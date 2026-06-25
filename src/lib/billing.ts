@@ -134,33 +134,16 @@ export async function activatePaidSubscription(i: {
   if (error) throw new Error(`activatePaidSubscription: ${error.message}`);
 }
 
-/** TEMP: grant access to a tester without payment (no card, no auto-renew). */
-export async function grantTesterAccess(
+/**
+ * Renewal success — extend the period; clear dunning state. When `newPlan` is
+ * given (a scheduled downgrade taking effect), the plan is switched and the
+ * pending flag cleared in the same atomic UPDATE.
+ */
+export async function renewSubscription(
   userId: string,
-  plan: PaidPlan,
-  expiresAt: Date,
+  sum: number,
+  newPlan?: PaidPlan,
 ): Promise<void> {
-  const now = new Date();
-  const { error } = await supabaseAdmin
-    .from("subscriptions")
-    .update({
-      plan,
-      status: "active",
-      purchased_at: iso(now),
-      expires_at: iso(expiresAt),
-      next_billing_at: null,
-      auto_renew: false,
-      cancel_at_period_end: false,
-      failed_charge_count: 0,
-      dunning_status: "tester",
-      updated_at: iso(now),
-    })
-    .eq("user_id", userId);
-  if (error) throw new Error(`grantTesterAccess: ${error.message}`);
-}
-
-/** Renewal success — extend the period; clear dunning state. */
-export async function renewSubscription(userId: string, sum: number): Promise<void> {
   const now = new Date();
   const nextBilling = addMonths(now, 1);
   const { error } = await supabaseAdmin
@@ -174,10 +157,79 @@ export async function renewSubscription(userId: string, sum: number): Promise<vo
       last_payment_at: iso(now),
       last_payment_amount: sum,
       last_charge_attempt_at: iso(now),
+      ...(newPlan ? { plan: newPlan, pending_plan: null } : {}),
       updated_at: iso(now),
     })
     .eq("user_id", userId);
   if (error) throw new Error(`renewSubscription: ${error.message}`);
+}
+
+// ---------------------------------------------------------------------------
+// Plan changes (upgrade / downgrade / trial switch)
+// ---------------------------------------------------------------------------
+
+/**
+ * Apply an immediate upgrade after a successful proration charge: switch the
+ * plan now WITHOUT touching the billing anchor (next_billing_at / expires_at).
+ * The next renewal bills the full new-plan price.
+ */
+export async function applyUpgrade(userId: string, newPlan: PaidPlan): Promise<void> {
+  const { error } = await supabaseAdmin
+    .from("subscriptions")
+    .update({ plan: newPlan, pending_plan: null, updated_at: iso(new Date()) })
+    .eq("user_id", userId);
+  if (error) throw new Error(`applyUpgrade: ${error.message}`);
+}
+
+/**
+ * Change the plan immediately with no charge — used during the free trial,
+ * where the eventual first charge at trial end uses whatever plan is set then.
+ * Keeps trial_ends_at / trial_used / next_billing_at intact.
+ */
+export async function changePlanImmediate(userId: string, newPlan: PaidPlan): Promise<void> {
+  const { error } = await supabaseAdmin
+    .from("subscriptions")
+    .update({ plan: newPlan, pending_plan: null, updated_at: iso(new Date()) })
+    .eq("user_id", userId);
+  if (error) throw new Error(`changePlanImmediate: ${error.message}`);
+}
+
+/** Schedule a downgrade to take effect at the next renewal (period end). */
+export async function schedulePlanChange(userId: string, pendingPlan: PaidPlan): Promise<void> {
+  const { error } = await supabaseAdmin
+    .from("subscriptions")
+    .update({ pending_plan: pendingPlan, updated_at: iso(new Date()) })
+    .eq("user_id", userId);
+  if (error) throw new Error(`schedulePlanChange: ${error.message}`);
+}
+
+/** Cancel a scheduled (pending) plan change — e.g. user upgrades back. */
+export async function clearPendingPlan(userId: string): Promise<void> {
+  const { error } = await supabaseAdmin
+    .from("subscriptions")
+    .update({ pending_plan: null, updated_at: iso(new Date()) })
+    .eq("user_id", userId);
+  if (error) throw new Error(`clearPendingPlan: ${error.message}`);
+}
+
+/**
+ * Atomically claim the subscription for an immediate upgrade charge by stamping
+ * the same `last_charge_attempt_at` window the renewal job uses. Succeeds only
+ * if the row is not already claimed — this serializes concurrent upgrades and
+ * keeps the renewal job from racing the proration charge. Returns false if busy.
+ */
+export async function claimForUpgrade(userId: string): Promise<boolean> {
+  const now = new Date();
+  const windowIso = iso(new Date(now.getTime() - 50 * 60_000));
+  const { data, error } = await supabaseAdmin
+    .from("subscriptions")
+    .update({ last_charge_attempt_at: iso(now) })
+    .eq("user_id", userId)
+    .or(`last_charge_attempt_at.is.null,last_charge_attempt_at.lt.${windowIso}`)
+    .select("user_id")
+    .maybeSingle();
+  if (error) throw new Error(`claimForUpgrade: ${error.message}`);
+  return !!data;
 }
 
 /** Start the free trial (save-token-only flow). No charge. */
@@ -290,7 +342,7 @@ export interface RecordPaymentInput {
   transactionGroupId?: number | string | null;
   cardSuffix?: string | null;
   cardBrand?: string | null;
-  kind: "subscribe" | "trial" | "renewal" | "refund";
+  kind: "subscribe" | "trial" | "renewal" | "refund" | "upgrade";
   status: "success" | "failed" | "rejected_amount" | "pending";
   errorText?: string | null;
 }
@@ -420,6 +472,8 @@ export async function recordConsent(i: {
 export interface DueSubscription {
   userId: string;
   plan: PaidPlan;
+  /** Scheduled downgrade target to apply on this renewal, if any. */
+  pendingPlan: PaidPlan | null;
   cardSuffix: string | null;
   billingGroupId: number;
 }
@@ -436,6 +490,7 @@ export async function claimDueSubscriptions(limit: number): Promise<DueSubscript
   return rows.map((r) => ({
     userId: String(r.user_id),
     plan: r.plan as PaidPlan,
+    pendingPlan: (r.pending_plan as PaidPlan | null) ?? null,
     cardSuffix: (r.card_suffix as string | null) ?? null,
     billingGroupId: Number(r.billing_group_id),
   }));

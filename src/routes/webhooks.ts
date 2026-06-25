@@ -92,17 +92,27 @@ webhooksRoute.post("/", async (c) => {
 
   // --- card replacement (no state change, no approve) ---
   if (mode === "update_card") {
-    if (cardToken) {
-      await billing.savePaymentMethod({
-        userId,
-        token: cardToken,
-        cardSuffix,
-        cardBrand,
-        name: fullName,
-        phone: payerPhone,
-        email: payerEmail,
-      });
+    if (!cardToken) return c.json({ ok: false, ignored: true, reason: "no_token" });
+    // Verify server-to-server before trusting the token — otherwise anyone who
+    // can reach this endpoint could swap a user's saved card.
+    if (!processId || !processToken) {
+      logger.warn({ userId }, "update_card_unverified_missing_process");
+      return c.json({ ok: false, ignored: true, reason: "unverified_update_card" });
     }
+    const info = await grow.getPaymentProcessInfo(processId, processToken);
+    if (!isGrowSuccess(info)) {
+      logger.warn({ userId }, "update_card_unverified");
+      return c.json({ ok: false, ignored: true, reason: "unverified_update_card" });
+    }
+    await billing.savePaymentMethod({
+      userId,
+      token: cardToken,
+      cardSuffix,
+      cardBrand,
+      name: fullName,
+      phone: payerPhone,
+      email: payerEmail,
+    });
     return c.json({ ok: true, kind: "update_card" });
   }
 
@@ -208,7 +218,14 @@ webhooksRoute.post("/", async (c) => {
   });
 
   // Finalize with Grow — ONLY the first transaction. Stops the 5x retries.
-  await grow.approveTransaction(d);
+  // The charge is already verified, activated and recorded; if approve fails we
+  // must still return 200 (Grow will re-send, and idempotency will dedupe) so we
+  // don't 500 a successful subscription.
+  try {
+    await grow.approveTransaction(d);
+  } catch (e) {
+    logger.error({ err: String(e), userId, plan }, "approve_transaction_failed");
+  }
   logger.info({ userId, plan, verifiedSum }, "subscription_activated");
   return c.json({ ok: true, kind: "subscribe" });
 });
