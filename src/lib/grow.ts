@@ -89,16 +89,25 @@ async function postForm<T = Record<string, unknown>>(
     body.set(k, typeof v === "boolean" ? (v ? "1" : "0") : String(v));
   }
 
+  // Hard timeout: without it a hung Grow call can run long enough to breach the
+  // 50-minute renewal claim window and let the next tick double-charge. An abort
+  // surfaces as network_error, which the renewal/reconcile paths treat as
+  // "uncertain" (leave pending, never re-charge blindly).
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30_000);
   let res: Response;
   try {
     res = await fetch(`${config.meshulam.base}/${path}`, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: body.toString(),
+      signal: controller.signal,
     });
   } catch (e) {
     logger.error({ err: e, path }, "grow_network_error");
     return { status: 0, err: { message: "network_error" } };
+  } finally {
+    clearTimeout(timer);
   }
 
   const json = (await res.json().catch(() => null)) as GrowResult<T> | null;
@@ -144,6 +153,10 @@ export interface PaymentProcessData {
 
 /** Create a hosted credit-card payment form (and save the card token). */
 async function createPaymentProcess(p: CreatePaymentProcessParams) {
+  // Save-token-only flows (trial, update-card) collect no money, so they must NOT
+  // request a tax invoice or carry an invoice line item — otherwise Grow could
+  // issue a phantom ₪1 invoice for funds never charged.
+  const isCharge = p.chargeType !== ChargeType.SAVE_TOKEN_ONLY;
   return postForm<PaymentProcessData>("createPaymentProcess", {
     ...auth(),
     chargeType: p.chargeType,
@@ -153,7 +166,7 @@ async function createPaymentProcess(p: CreatePaymentProcessParams) {
     successUrl: p.successUrl,
     cancelUrl: p.cancelUrl,
     notifyUrl: p.notifyUrl,
-    invoiceNotifyUrl: p.invoiceNotifyUrl,
+    invoiceNotifyUrl: isCharge ? p.invoiceNotifyUrl : undefined,
     "pageField[fullName]": p.fullName,
     "pageField[phone]": p.phone,
     "pageField[email]": p.email,
@@ -162,9 +175,9 @@ async function createPaymentProcess(p: CreatePaymentProcessParams) {
     // credit card ONLY — no wallets (Bit / Apple Pay / Google Pay / PayBox / bank transfer).
     "transactionTypes[0]": TransactionType.CREDIT_CARD,
     // invoice line item so Grow issues a proper tax invoice (price must equal sum -> err 617).
-    "productData[0][itemDescription]": p.description,
-    "productData[0][quantity]": 1,
-    "productData[0][price]": p.sum,
+    "productData[0][itemDescription]": isCharge ? p.description : undefined,
+    "productData[0][quantity]": isCharge ? 1 : undefined,
+    "productData[0][price]": isCharge ? p.sum : undefined,
     cField1: p.cField1,
     cField2: p.cField2,
     cField3: p.cField3,
@@ -185,6 +198,10 @@ export interface ChargeTokenParams {
   /** Numeric, NOT unique — for grouping/investigation. */
   transactionGroupIdentifier?: number | string;
   invoiceNotifyUrl?: string;
+  /** Customer business name for the tax invoice (so renewals are deductible). */
+  invoiceName?: string;
+  /** Customer ע.מ/ח.פ for the tax invoice. */
+  invoiceLicenseNumber?: string;
   cField1?: string;
   cField2?: string;
   cField3?: string;
@@ -214,6 +231,10 @@ async function createTransactionWithToken(p: ChargeTokenParams) {
     transactionUniqueIdentifier: p.transactionUniqueIdentifier,
     transactionGroupIdentifier: p.transactionGroupIdentifier,
     invoiceNotifyUrl: p.invoiceNotifyUrl,
+    // Customer business details so EVERY recurring/upgrade invoice carries the
+    // ע.מ/ח.פ and is VAT-deductible (not just the first hosted-checkout invoice).
+    "pageField[invoiceName]": p.invoiceName,
+    "pageField[invoiceLicenseNumber]": p.invoiceLicenseNumber,
     "productData[0][itemDescription]": p.description,
     "productData[0][quantity]": 1,
     "productData[0][price]": p.sum,

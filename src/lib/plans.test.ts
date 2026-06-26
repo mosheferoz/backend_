@@ -48,6 +48,14 @@ describe("plans", () => {
     expect(amountMatches("premium", 149.5, 4)).toBe(true); // at the upper bound
   });
 
+  it("amountMatches rejects the full/VAT-inflated price during the promo window", () => {
+    // Cycle 1 expects promo; the regular price (or VAT-on-top) must NOT pass.
+    expect(amountMatches("premium", 149, 1)).toBe(false); // full regular at promo cycle
+    expect(amountMatches("pro", 249, 1)).toBe(false);
+    expect(amountMatches("premium", 57.82, 1)).toBe(false); // 49 + 18% VAT on top
+    expect(amountMatches("pro", 116.82, 1)).toBe(false); // 99 + 18% VAT on top
+  });
+
   describe("prorationDelta", () => {
     it("charges the full price difference for a full period remaining", () => {
       // promo cycle: pro 99 - premium 49 = 50

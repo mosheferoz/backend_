@@ -79,6 +79,8 @@ export async function runRenewals(): Promise<RenewalSummary> {
         transactionUniqueIdentifier: uniqueId,
         transactionGroupIdentifier: sub.billingGroupId,
         invoiceNotifyUrl: growInvoiceNotifyUrl(),
+        invoiceName: contact.businessName ?? contact.fullName,
+        invoiceLicenseNumber: contact.businessId ?? undefined,
         cField1: sub.userId,
         cField2: effectivePlan,
         cField3: "renewal",

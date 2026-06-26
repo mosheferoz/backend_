@@ -1,5 +1,14 @@
-import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
+import { createCipheriv, createDecipheriv, randomBytes, timingSafeEqual } from "node:crypto";
 import { config } from "../config.js";
+
+/** Constant-time string comparison for secrets (avoids timing side-channels). */
+export function safeEqual(a: string | null | undefined, b: string | null | undefined): boolean {
+  if (!a || !b) return false;
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ab.length !== bb.length) return false;
+  return timingSafeEqual(ab, bb);
+}
 
 /**
  * App-level AES-256-GCM encryption for card tokens at rest. This is

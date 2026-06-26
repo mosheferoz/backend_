@@ -1,4 +1,4 @@
-import { grow, tokenQueryIndicatesPaid } from "../lib/grow.js";
+import { grow, tokenQueryIndicatesPaid, isGrowSuccess } from "../lib/grow.js";
 import * as billing from "../lib/billing.js";
 import { priceFor, type PaidPlan } from "../lib/plans.js";
 import { supabaseAdmin } from "../lib/supabaseAdmin.js";
@@ -15,7 +15,25 @@ export interface ReconcileSummary {
  * mid-charge). The transactionUniqueIdentifier lets us ask Grow what actually
  * happened, so we never double-charge on the next renewal pass.
  */
+// Guard against overlapping runs in the same process (node-cron doesn't skip a
+// still-running job). Reconcile takes no DB row-lock, so two concurrent passes
+// over the same 'pending' rows would double-apply increments — this prevents it.
+let reconcileRunning = false;
+
 export async function runReconcile(): Promise<ReconcileSummary> {
+  if (reconcileRunning) {
+    logger.warn("reconcile_already_running_skip");
+    return { checked: 0, renewed: 0, failed: 0 };
+  }
+  reconcileRunning = true;
+  try {
+    return await reconcileInner();
+  } finally {
+    reconcileRunning = false;
+  }
+}
+
+async function reconcileInner(): Promise<ReconcileSummary> {
   const cutoff = new Date(Date.now() - 10 * 60_000).toISOString();
   const { data, error } = await supabaseAdmin
     .from("subscription_payments")
@@ -47,6 +65,14 @@ export async function runReconcile(): Promise<ReconcileSummary> {
         cardToken: pm.token,
         transactionUniqueIdentifier: uniqueId,
       });
+      // Transport failure ("couldn't reach Grow") is NOT the same as "Grow says
+      // not paid". Treating it as a failure here would dun/downgrade paying
+      // customers during a Grow outage (and, if the charge actually succeeded,
+      // charge them AND revoke access). Leave the row 'pending' for a later pass.
+      const unreachable =
+        !isGrowSuccess(q) &&
+        (q?.err?.message === "network_error" || q?.err?.message === "invalid_json");
+
       if (tokenQueryIndicatesPaid(q)) {
         const amount = (p.amount as number) ?? priceFor(plan);
         if (kind === "upgrade") {
@@ -59,6 +85,9 @@ export async function runReconcile(): Promise<ReconcileSummary> {
         await billing.incrementChargeCount(userId);
         await billing.finalizePayment(uniqueId, { status: "success" });
         renewed++;
+      } else if (unreachable) {
+        logger.warn({ userId, uniqueId }, "reconcile_unreachable_left_pending");
+        // Intentionally do nothing: not success, not failure — retry next pass.
       } else {
         await billing.finalizePayment(uniqueId, { status: "failed", errorText: "reconcile_not_found" });
         // A failed renewal enters dunning; a failed upgrade must NOT — the

@@ -1,6 +1,7 @@
 import cron from "node-cron";
 import { runRenewals } from "./renew.js";
 import { runReconcile } from "./reconcile.js";
+import { runTrialReminders } from "./notifications.js";
 import { logger } from "../lib/logger.js";
 
 /**
@@ -23,9 +24,17 @@ export function startScheduler(): () => void {
       .catch((e) => logger.error({ err: String(e) }, "scheduled_reconcile_failed"));
   });
 
-  logger.info("scheduler started (renewals hourly, reconcile every 30m)");
+  // Trial-ending reminder emails, every 6 hours.
+  const reminders = cron.schedule("0 */6 * * *", () => {
+    runTrialReminders()
+      .then((n) => logger.info({ sent: n }, "scheduled_trial_reminders"))
+      .catch((e) => logger.error({ err: String(e) }, "scheduled_trial_reminders_failed"));
+  });
+
+  logger.info("scheduler started (renewals hourly, reconcile every 30m, trial reminders every 6h)");
   return () => {
     renew.stop();
     reconcile.stop();
+    reminders.stop();
   };
 }

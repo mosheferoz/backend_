@@ -1,12 +1,19 @@
 import { supabaseAdmin } from "./supabaseAdmin.js";
 import { encryptToken, decryptToken } from "./crypto.js";
 import { GRACE_DAYS, TRIAL_DAYS, type PaidPlan } from "./plans.js";
+import { sendEmail, dunningHtml } from "./mail.js";
 import { logger } from "./logger.js";
 
 // --- date helpers (calendar-correct month/day math) ---
 function addMonths(d: Date, n: number): Date {
   const x = new Date(d);
+  const day = x.getDate();
+  // Move on the 1st to avoid JS overflow (Jan 31 + 1m would roll into March),
+  // then clamp to the last valid day of the target month (-> Feb 28/29).
+  x.setDate(1);
   x.setMonth(x.getMonth() + n);
+  const lastDayOfMonth = new Date(x.getFullYear(), x.getMonth() + 1, 0).getDate();
+  x.setDate(Math.min(day, lastDayOfMonth));
   return x;
 }
 function addDays(d: Date, n: number): Date {
@@ -121,8 +128,12 @@ export async function activatePaidSubscription(i: {
       expires_at: iso(addDays(nextBilling, GRACE_DAYS)),
       auto_renew: true,
       cancel_at_period_end: false,
+      // Clear any stale scheduled downgrade from a prior subscription lifecycle
+      // so a re-subscribe doesn't silently re-apply it on the next renewal.
+      pending_plan: null,
       failed_charge_count: 0,
       dunning_status: null,
+      dunning_warned_at: null,
       last_payment_at: iso(now),
       last_payment_amount: i.sum,
       card_suffix: i.cardSuffix ?? null,
@@ -145,7 +156,17 @@ export async function renewSubscription(
   newPlan?: PaidPlan,
 ): Promise<void> {
   const now = new Date();
-  const nextBilling = addMonths(now, 1);
+  // Anchor the next charge to the PREVIOUS billing date, not the execution time,
+  // so the billing day-of-month stays stable instead of drifting forward a bit
+  // every cycle. If we're catching up late, roll forward until it's in the future.
+  const { data: cur } = await supabaseAdmin
+    .from("subscriptions")
+    .select("next_billing_at")
+    .eq("user_id", userId)
+    .maybeSingle();
+  const prevAnchor = cur?.next_billing_at ? new Date(cur.next_billing_at as string) : now;
+  let nextBilling = addMonths(prevAnchor, 1);
+  while (nextBilling.getTime() <= now.getTime()) nextBilling = addMonths(nextBilling, 1);
   const { error } = await supabaseAdmin
     .from("subscriptions")
     .update({
@@ -154,6 +175,7 @@ export async function renewSubscription(
       expires_at: iso(addDays(nextBilling, GRACE_DAYS)),
       failed_charge_count: 0,
       dunning_status: null,
+      dunning_warned_at: null,
       last_payment_at: iso(now),
       last_payment_amount: sum,
       last_charge_attempt_at: iso(now),
@@ -280,6 +302,27 @@ export async function recordRenewalFailure(
     .eq("user_id", userId);
   if (cardDead) await invalidatePaymentMethod(userId);
   logger.warn({ userId, count, cardDead, errorText }, "renewal_failure");
+
+  // One-time dunning warning email (best-effort; reset to null on recovery so a
+  // future failure warns again).
+  try {
+    const { data: warned } = await supabaseAdmin
+      .from("subscriptions")
+      .select("dunning_warned_at")
+      .eq("user_id", userId)
+      .maybeSingle();
+    if (!warned?.dunning_warned_at) {
+      const contact = await getProfileBillingContact(userId);
+      if (await sendEmail(contact.email, "חיוב המנוי נכשל — נדרשת פעולה", dunningHtml(contact.fullName))) {
+        await supabaseAdmin
+          .from("subscriptions")
+          .update({ dunning_warned_at: iso(now) })
+          .eq("user_id", userId);
+      }
+    }
+  } catch (e) {
+    logger.warn({ err: String(e), userId }, "dunning_email_failed");
+  }
 }
 
 /**
@@ -296,6 +339,8 @@ export async function expireOverdueSubscriptions(): Promise<number> {
     trial_ends_at: null,
     auto_renew: false,
     cancel_at_period_end: false,
+    // Drop any scheduled downgrade so it can't resurface after a re-subscribe.
+    pending_plan: null,
     dunning_status: "downgraded",
     updated_at: nowIso,
   };
@@ -328,6 +373,27 @@ export async function setCancelAtPeriodEnd(userId: string, cancel: boolean): Pro
   if (error) throw new Error(`setCancelAtPeriodEnd: ${error.message}`);
 }
 
+/**
+ * Card was replaced (update-card flow) — re-arm renewals. Resets the failure
+ * counter and dunning state, and clears the claim stamp so the next renewal pass
+ * can immediately retry the now-valid card. Without this a customer who updates
+ * their card after 3 failed charges stays excluded from claim_due_subscriptions
+ * (failed_charge_count >= 3) and is downgraded despite a working card.
+ */
+export async function clearDunningOnCardUpdate(userId: string): Promise<void> {
+  const { error } = await supabaseAdmin
+    .from("subscriptions")
+    .update({
+      failed_charge_count: 0,
+      dunning_status: null,
+      dunning_warned_at: null,
+      last_charge_attempt_at: null,
+      updated_at: iso(new Date()),
+    })
+    .eq("user_id", userId);
+  if (error) throw new Error(`clearDunningOnCardUpdate: ${error.message}`);
+}
+
 // ---------------------------------------------------------------------------
 // Payments ledger (idempotent) + consent + invoices
 // ---------------------------------------------------------------------------
@@ -337,12 +403,14 @@ export interface RecordPaymentInput {
   plan: string;
   amount?: number | null;
   providerTxnId?: string | null;
+  /** Grow transaction token — needed later to issue a refund for this charge. */
+  providerTxnToken?: string | null;
   asmachta?: string | null;
   transactionUniqueId?: number | string | null;
   transactionGroupId?: number | string | null;
   cardSuffix?: string | null;
   cardBrand?: string | null;
-  kind: "subscribe" | "trial" | "renewal" | "refund" | "upgrade";
+  kind: "subscribe" | "trial" | "renewal" | "refund" | "upgrade" | "storage_addon";
   status: "success" | "failed" | "rejected_amount" | "pending";
   errorText?: string | null;
 }
@@ -355,6 +423,7 @@ export async function recordPayment(i: RecordPaymentInput): Promise<{ deduped: b
     amount: i.amount ?? null,
     provider: "grow",
     provider_txn_id: i.providerTxnId ?? null,
+    provider_txn_token: i.providerTxnToken ?? null,
     asmachta: i.asmachta ?? null,
     transaction_unique_id: i.transactionUniqueId ?? null,
     transaction_group_id: i.transactionGroupId ?? null,
@@ -437,15 +506,133 @@ export async function isTxnProcessed(providerTxnId: string): Promise<boolean> {
 }
 
 export async function attachInvoice(
-  providerTxnId: string,
+  providerTxnId: string | undefined,
+  asmachta: string | undefined,
   ref: string | undefined,
   url: string | undefined,
 ): Promise<void> {
   if (!ref && !url) return;
-  await supabaseAdmin
+  const fields = { invoice_ref: ref ?? null, invoice_url: url ?? null };
+  // Primary match: provider_txn_id (the dedupe / finalize id we stored).
+  if (providerTxnId) {
+    const { data } = await supabaseAdmin
+      .from("subscription_payments")
+      .update(fields)
+      .eq("provider_txn_id", providerTxnId)
+      .select("id");
+    if (data && data.length) return;
+  }
+  // Fallback: some invoice notifies key off the asmachta rather than the txn id
+  // (or the row stored asmachta as its provider_txn_id). Don't silently drop it.
+  if (asmachta) {
+    const { data } = await supabaseAdmin
+      .from("subscription_payments")
+      .update(fields)
+      .eq("asmachta", asmachta)
+      .select("id");
+    if (data && data.length) return;
+  }
+  logger.warn({ providerTxnId, asmachta }, "invoice_notify_unmatched");
+}
+
+// ---------------------------------------------------------------------------
+// Refunds (14-day cooling-off)
+// ---------------------------------------------------------------------------
+
+export interface RefundableCharge {
+  providerTxnId: string;
+  providerTxnToken: string;
+  amount: number;
+  plan: string;
+  createdAt: string;
+}
+
+/**
+ * The user's most recent successful paid charge (subscribe/renewal, amount>0)
+ * that still has a Grow token to refund against and has NOT already been
+ * refunded. The 14-day eligibility window is enforced by the caller. Returns
+ * null when there's nothing refundable (no token = a charge from before refund
+ * support shipped → must be refunded manually in the Grow dashboard).
+ */
+export async function getRefundableCharge(userId: string): Promise<RefundableCharge | null> {
+  const { data, error } = await supabaseAdmin
     .from("subscription_payments")
-    .update({ invoice_ref: ref ?? null, invoice_url: url ?? null })
-    .eq("provider_txn_id", providerTxnId);
+    .select("provider_txn_id, provider_txn_token, amount, plan, created_at")
+    .eq("user_id", userId)
+    .eq("status", "success")
+    .in("kind", ["subscribe", "renewal"])
+    .gt("amount", 0)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw new Error(`getRefundableCharge: ${error.message}`);
+  if (!data?.provider_txn_id || !data?.provider_txn_token) return null;
+
+  // Already refunded? (refund rows are stored as `refund:<original txn id>`.)
+  const { data: existing } = await supabaseAdmin
+    .from("subscription_payments")
+    .select("id")
+    .eq("user_id", userId)
+    .eq("kind", "refund")
+    .eq("provider_txn_id", `refund:${data.provider_txn_id}`)
+    .limit(1);
+  if (existing && existing.length) return null;
+
+  return {
+    providerTxnId: String(data.provider_txn_id),
+    providerTxnToken: String(data.provider_txn_token),
+    amount: Number(data.amount),
+    plan: String(data.plan),
+    createdAt: String(data.created_at),
+  };
+}
+
+/** Record a refund in the ledger (id prefixed to avoid the provider_txn_id unique index). */
+export async function recordRefund(i: {
+  userId: string;
+  plan: string;
+  amount: number;
+  refundedTxnId: string;
+}): Promise<void> {
+  const { error } = await supabaseAdmin.from("subscription_payments").insert({
+    user_id: i.userId,
+    plan: i.plan,
+    amount: i.amount,
+    provider: "grow",
+    provider_txn_id: `refund:${i.refundedTxnId}`,
+    kind: "refund",
+    status: "success",
+  });
+  if (error) throw new Error(`recordRefund: ${error.message}`);
+}
+
+/** Grant purchased storage after a verified charge (service-role RPC). */
+export async function grantStoragePurchase(userId: string, gb: number): Promise<void> {
+  const { error } = await supabaseAdmin.rpc("grant_storage_purchase", {
+    p_user_id: userId,
+    p_gb: gb,
+  });
+  if (error) throw new Error(`grantStoragePurchase: ${error.message}`);
+}
+
+/** Immediate downgrade to free after a cooling-off refund (access ends now). */
+export async function downgradeToFreeImmediate(userId: string): Promise<void> {
+  const { error } = await supabaseAdmin
+    .from("subscriptions")
+    .update({
+      plan: "free",
+      status: "active",
+      expires_at: null,
+      next_billing_at: null,
+      trial_ends_at: null,
+      auto_renew: false,
+      cancel_at_period_end: false,
+      pending_plan: null,
+      dunning_status: "refunded",
+      updated_at: iso(new Date()),
+    })
+    .eq("user_id", userId);
+  if (error) throw new Error(`downgradeToFreeImmediate: ${error.message}`);
 }
 
 export async function recordConsent(i: {

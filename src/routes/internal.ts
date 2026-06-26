@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { config } from "../config.js";
+import { safeEqual } from "../lib/crypto.js";
 import { runRenewals } from "../jobs/renew.js";
 import { runReconcile } from "../jobs/reconcile.js";
 
@@ -10,7 +11,7 @@ import { runReconcile } from "../jobs/reconcile.js";
 export const internalRoute = new Hono();
 
 internalRoute.use("*", async (c, next) => {
-  if (c.req.header("x-cron-secret") !== config.cronSecret) {
+  if (!safeEqual(c.req.header("x-cron-secret"), config.cronSecret)) {
     return c.json({ ok: false, error: "unauthorized" }, 401);
   }
   await next();

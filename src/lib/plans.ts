@@ -27,6 +27,14 @@ export const PLAN_LABELS: Record<PaidPlan, string> = {
   pro: "Pro",
 };
 
+/** One-time storage add-on packages: GB → price (₪, VAT-inclusive). Must match
+ *  the prices shown in the client StorageUpgradeDialog. */
+export const STORAGE_PACKAGES: Record<number, number> = {
+  5: 19,
+  20: 49,
+  50: 99,
+};
+
 export const TRIAL_DAYS = 14;
 /** Dunning grace window after a failed renewal before downgrade to free. */
 export const GRACE_DAYS = 3;
@@ -61,10 +69,12 @@ export function amountMatches(
 ): boolean {
   if (sum == null || Number.isNaN(sum)) return false;
   const expected = priceFor(plan, cycleNumber);
-  // Lower bound: anti-tampering (no spoofed low amount). Upper bound: catch a
-  // silent overcharge (e.g. VAT mistakenly added on top). Allow ₪0.5 rounding
-  // and any legitimate higher tier (regular > promo) — but not an unbounded sum.
-  return sum >= expected - 0.5 && sum <= PLAN_PRICING[plan].regular + 0.5;
+  // Both bounds are anchored to the price expected for THIS cycle (promo in the
+  // promo window, regular afterwards), with ₪0.5 rounding tolerance. Lower bound:
+  // anti-tampering (no spoofed undercharge). Upper bound: catch a silent
+  // overcharge — including the full/VAT-inflated price wrongly applied DURING the
+  // promo window (a cycle-independent ceiling would have let ₪149 pass at cycle 1).
+  return sum >= expected - 0.5 && sum <= expected + 0.5;
 }
 
 function round2(n: number): number {

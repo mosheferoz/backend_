@@ -4,9 +4,18 @@ import { grow, isGrowSuccess } from "../lib/grow.js";
 import { isPaidPlan, amountMatches, type PaidPlan } from "../lib/plans.js";
 import * as billing from "../lib/billing.js";
 import { extractInvoiceRef } from "../lib/invoices.js";
+import { rateLimit } from "../lib/rateLimit.js";
+import { safeEqual } from "../lib/crypto.js";
+import { alertAdmin } from "../lib/mail.js";
 import { logger } from "../lib/logger.js";
 
 export const webhooksRoute = new Hono();
+
+// Defense-in-depth throttle. Legit Grow notifies are user-driven and low-volume
+// (hosted-page completions + invoice notifies), so a generous per-IP cap blocks
+// scripted abuse without ever rejecting real traffic. The real protection is the
+// mandatory server-to-server re-verification in each handler below.
+webhooksRoute.use("*", rateLimit({ windowMs: 60_000, max: 100, keyPrefix: "webhook" }));
 
 // Grow doesn't sign webhooks; the real protection is server-to-server
 // re-verification (getTransactionInfo / getPaymentProcessInfo) inside each
@@ -16,7 +25,7 @@ export const webhooksRoute = new Hono();
 webhooksRoute.use("*", async (c, next) => {
   const provided =
     c.req.header("x-grow-secret") ?? new URL(c.req.url).searchParams.get("secret");
-  if (provided != null && provided !== config.growNotifySecret) {
+  if (provided != null && !safeEqual(provided, config.growNotifySecret)) {
     return c.json({ ok: false, error: "unauthorized" }, 401);
   }
   await next();
@@ -113,6 +122,9 @@ webhooksRoute.post("/", async (c) => {
       phone: payerPhone,
       email: payerEmail,
     });
+    // Re-arm renewals: a card replaced during dunning must not stay excluded
+    // from the renewal job (failed_charge_count >= 3) and get downgraded.
+    await billing.clearDunningOnCardUpdate(userId);
     return c.json({ ok: true, kind: "update_card" });
   }
 
@@ -125,9 +137,18 @@ webhooksRoute.post("/", async (c) => {
   // --- trial: save token only, NO charge, NO approve (J-style) ---
   if (mode === "trial") {
     if (!cardToken) return c.json({ ok: false, ignored: true, reason: "trial_without_token" });
-    if (processId && processToken) {
-      const info = await grow.getPaymentProcessInfo(processId, processToken);
-      if (!isGrowSuccess(info)) return c.json({ ok: false, ignored: true, reason: "unverified_trial" });
+    // SECURITY: NEVER start a trial / store a card token from an unverified
+    // notify. Require the hosted-process identifiers and confirm them
+    // server-to-server first (same as update_card); otherwise a forged POST
+    // could grant a free trial or overwrite a victim's saved card token.
+    if (!processId || !processToken) {
+      logger.warn({ userId }, "trial_unverified_missing_process");
+      return c.json({ ok: false, ignored: true, reason: "unverified_trial" });
+    }
+    const info = await grow.getPaymentProcessInfo(processId, processToken);
+    if (!isGrowSuccess(info)) {
+      logger.warn({ userId }, "trial_unverified");
+      return c.json({ ok: false, ignored: true, reason: "unverified_trial" });
     }
     await billing.savePaymentMethod({
       userId,
@@ -154,7 +175,10 @@ webhooksRoute.post("/", async (c) => {
     return c.json({ ok: true, kind: "trial" });
   }
 
-  // --- subscribe: never trust the webhook amount; verify server-to-server ---
+  // --- subscribe: NEVER trust the webhook amount; verify server-to-server. A
+  // notify with no verifiable identifiers is rejected outright — a forged POST
+  // must never be able to activate a paid plan from a body-supplied `sum`. The
+  // body `sum` is only used as a fallback AFTER Grow has confirmed the txn. ---
   let verifiedSum = NaN;
   if (transactionId && transactionToken) {
     const info = await grow.getTransactionInfo(transactionId, transactionToken);
@@ -164,8 +188,17 @@ webhooksRoute.post("/", async (c) => {
     }
     const id = (info.data ?? {}) as Dict;
     verifiedSum = Number(pick(id, ["sum", "paymentSum"]) ?? pick(d, ["sum", "paymentSum"]));
+  } else if (processId && processToken) {
+    const info = await grow.getPaymentProcessInfo(processId, processToken);
+    if (!isGrowSuccess(info)) {
+      logger.warn({ userId, processId }, "verify_process_not_success");
+      return c.json({ ok: false, ignored: true, reason: "unverified" });
+    }
+    const id = (info.data ?? {}) as Dict;
+    verifiedSum = Number(pick(id, ["sum", "paymentSum"]) ?? pick(d, ["sum", "paymentSum"]));
   } else {
-    verifiedSum = Number(pick(d, ["sum", "paymentSum"]));
+    logger.warn({ userId }, "subscribe_unverified_missing_identifiers");
+    return c.json({ ok: false, ignored: true, reason: "unverified" });
   }
 
   // Validate against the price for this user's current cycle (promo vs regular).
@@ -184,6 +217,7 @@ webhooksRoute.post("/", async (c) => {
       errorText: `amount_mismatch got=${verifiedSum}`,
     });
     logger.error({ userId, plan, verifiedSum }, "amount_mismatch");
+    await alertAdmin("amount_mismatch (possible tampering)", { userId, plan, verifiedSum, cycle });
     return c.json({ ok: false, ignored: true, reason: "amount_mismatch" });
   }
 
@@ -210,6 +244,7 @@ webhooksRoute.post("/", async (c) => {
     plan,
     amount: verifiedSum,
     providerTxnId: dedupeKey,
+    providerTxnToken: transactionToken,
     asmachta,
     cardSuffix,
     cardBrand,
@@ -237,8 +272,11 @@ webhooksRoute.post("/invoice", async (c) => {
   const payload = parseBody(raw, c.req.header("content-type") ?? "");
   const d = (payload.data && typeof payload.data === "object" ? payload.data : payload) as Dict;
   const txnId = pick(d, ["transactionId", "transactionCode"]) ?? pick(payload, ["transactionId"]);
+  const asmachta = pick(d, ["asmachta"]) ?? pick(payload, ["asmachta"]);
   const { ref, url } = extractInvoiceRef(payload);
-  if (txnId) await billing.attachInvoice(txnId, ref, url);
-  logger.info({ txnId, ref }, "invoice_notify");
+  if (txnId || asmachta) {
+    await billing.attachInvoice(txnId ?? undefined, asmachta ?? undefined, ref, url);
+  }
+  logger.info({ txnId, asmachta, ref }, "invoice_notify");
   return c.json({ ok: true });
 });
