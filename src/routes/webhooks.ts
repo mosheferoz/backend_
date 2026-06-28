@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { config } from "../config.js";
-import { grow, isGrowSuccess } from "../lib/grow.js";
+import { grow } from "../lib/grow.js";
 import { isPaidPlan, amountMatches, type PaidPlan } from "../lib/plans.js";
 import * as billing from "../lib/billing.js";
 import { extractInvoiceRef } from "../lib/invoices.js";
@@ -11,21 +11,19 @@ import { logger } from "../lib/logger.js";
 
 export const webhooksRoute = new Hono();
 
-// Defense-in-depth throttle. Legit Grow notifies are user-driven and low-volume
-// (hosted-page completions + invoice notifies), so a generous per-IP cap blocks
-// scripted abuse without ever rejecting real traffic. The real protection is the
-// mandatory server-to-server re-verification in each handler below.
+// Generous per-IP throttle (defense-in-depth) against scripted abuse.
 webhooksRoute.use("*", rateLimit({ windowMs: 60_000, max: 100, keyPrefix: "webhook" }));
 
-// Grow doesn't sign webhooks; the real protection is server-to-server
-// re-verification (getTransactionInfo / getPaymentProcessInfo) inside each
-// handler. The secret is defense-in-depth: if one is supplied (our per-request
-// notifyUrl adds it) it MUST match; Grow's account-level notify may omit it, in
-// which case we still process and re-verify.
+// Authenticity gate: every notify MUST carry our shared secret. We register the
+// notifyUrl (and invoiceNotifyUrl) with `?secret=<GROW_NOTIFY_SECRET>`, so Grow
+// echoes it on every callback. This is the authenticity guard — once it passes,
+// handlers TRUST the notify payload directly. Per Grow's guidance, the pull-style
+// calls (getTransactionInfo / getPaymentProcessInfo) are for reconciliation ONLY
+// (when a notify did not arrive) and must NOT be used as routine verification.
 webhooksRoute.use("*", async (c, next) => {
   const provided =
     c.req.header("x-grow-secret") ?? new URL(c.req.url).searchParams.get("secret");
-  if (provided != null && !safeEqual(provided, config.growNotifySecret)) {
+  if (!safeEqual(provided, config.growNotifySecret)) {
     return c.json({ ok: false, error: "unauthorized" }, 401);
   }
   await next();
@@ -83,8 +81,6 @@ webhooksRoute.post("/", async (c) => {
 
   const transactionId = pick(d, ["transactionId", "transactionCode"]) ?? pick(payload, ["transactionId"]);
   const transactionToken = pick(d, ["transactionToken"]) ?? pick(payload, ["transactionToken"]);
-  const processId = pick(d, ["processId", "paymentLinkProcessId"]) ?? pick(payload, ["processId"]);
-  const processToken = pick(d, ["processToken", "paymentLinkProcessToken"]) ?? pick(payload, ["processToken"]);
   const asmachta = pick(d, ["asmachta"]) ?? pick(payload, ["asmachta"]);
   const cardToken = pick(d, ["cardToken", "token"]) ?? pick(payload, ["cardToken"]);
   const cardSuffix = pick(d, ["cardSuffix"]);
@@ -100,19 +96,10 @@ webhooksRoute.post("/", async (c) => {
   }
 
   // --- card replacement (no state change, no approve) ---
+  // The notify is authenticated by the shared secret above, so we trust it and
+  // save the new card token — no getPaymentProcessInfo pull (reconciliation-only).
   if (mode === "update_card") {
     if (!cardToken) return c.json({ ok: false, ignored: true, reason: "no_token" });
-    // Verify server-to-server before trusting the token — otherwise anyone who
-    // can reach this endpoint could swap a user's saved card.
-    if (!processId || !processToken) {
-      logger.warn({ userId }, "update_card_unverified_missing_process");
-      return c.json({ ok: false, ignored: true, reason: "unverified_update_card" });
-    }
-    const info = await grow.getPaymentProcessInfo(processId, processToken);
-    if (!isGrowSuccess(info)) {
-      logger.warn({ userId }, "update_card_unverified");
-      return c.json({ ok: false, ignored: true, reason: "unverified_update_card" });
-    }
     await billing.savePaymentMethod({
       userId,
       token: cardToken,
@@ -135,21 +122,10 @@ webhooksRoute.post("/", async (c) => {
   }
 
   // --- trial: save token only, NO charge, NO approve (J-style) ---
+  // The notify is authenticated by the shared secret above, so we trust it; no
+  // getPaymentProcessInfo pull (that call is reconciliation-only, per Grow).
   if (mode === "trial") {
     if (!cardToken) return c.json({ ok: false, ignored: true, reason: "trial_without_token" });
-    // SECURITY: NEVER start a trial / store a card token from an unverified
-    // notify. Require the hosted-process identifiers and confirm them
-    // server-to-server first (same as update_card); otherwise a forged POST
-    // could grant a free trial or overwrite a victim's saved card token.
-    if (!processId || !processToken) {
-      logger.warn({ userId }, "trial_unverified_missing_process");
-      return c.json({ ok: false, ignored: true, reason: "unverified_trial" });
-    }
-    const info = await grow.getPaymentProcessInfo(processId, processToken);
-    if (!isGrowSuccess(info)) {
-      logger.warn({ userId }, "trial_unverified");
-      return c.json({ ok: false, ignored: true, reason: "unverified_trial" });
-    }
     await billing.savePaymentMethod({
       userId,
       token: cardToken,
@@ -175,31 +151,11 @@ webhooksRoute.post("/", async (c) => {
     return c.json({ ok: true, kind: "trial" });
   }
 
-  // --- subscribe: NEVER trust the webhook amount; verify server-to-server. A
-  // notify with no verifiable identifiers is rejected outright — a forged POST
-  // must never be able to activate a paid plan from a body-supplied `sum`. The
-  // body `sum` is only used as a fallback AFTER Grow has confirmed the txn. ---
-  let verifiedSum = NaN;
-  if (transactionId && transactionToken) {
-    const info = await grow.getTransactionInfo(transactionId, transactionToken);
-    if (!isGrowSuccess(info)) {
-      logger.warn({ userId, transactionId }, "verify_refetch_not_success");
-      return c.json({ ok: false, ignored: true, reason: "unverified" });
-    }
-    const id = (info.data ?? {}) as Dict;
-    verifiedSum = Number(pick(id, ["sum", "paymentSum"]) ?? pick(d, ["sum", "paymentSum"]));
-  } else if (processId && processToken) {
-    const info = await grow.getPaymentProcessInfo(processId, processToken);
-    if (!isGrowSuccess(info)) {
-      logger.warn({ userId, processId }, "verify_process_not_success");
-      return c.json({ ok: false, ignored: true, reason: "unverified" });
-    }
-    const id = (info.data ?? {}) as Dict;
-    verifiedSum = Number(pick(id, ["sum", "paymentSum"]) ?? pick(d, ["sum", "paymentSum"]));
-  } else {
-    logger.warn({ userId }, "subscribe_unverified_missing_identifiers");
-    return c.json({ ok: false, ignored: true, reason: "unverified" });
-  }
+  // --- subscribe: the notify is authenticated by the shared secret, so we trust
+  // the amount it reports (no getTransactionInfo pull — that's reconciliation
+  // only, per Grow). amountMatches still guards against a wrong/misconfigured
+  // amount (e.g. VAT added on top) for the user's current cycle. ---
+  const verifiedSum = Number(pick(d, ["sum", "paymentSum"]));
 
   // Validate against the price for this user's current cycle (promo vs regular).
   const cycle = await billing.nextChargeCycle(userId);
