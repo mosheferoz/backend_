@@ -1,6 +1,7 @@
+import { randomUUID } from "node:crypto";
 import { supabaseAdmin } from "./supabaseAdmin.js";
 import { encryptToken, decryptToken } from "./crypto.js";
-import { GRACE_DAYS, TRIAL_DAYS, type PaidPlan } from "./plans.js";
+import { GRACE_DAYS, TRIAL_DAYS, isPaidPlan, type PaidPlan } from "./plans.js";
 import { sendEmail, dunningHtml } from "./mail.js";
 import { logger } from "./logger.js";
 
@@ -138,7 +139,9 @@ export async function activatePaidSubscription(i: {
       last_payment_amount: i.sum,
       card_suffix: i.cardSuffix ?? null,
       card_brand: i.cardBrand ?? null,
-      last_charge_attempt_at: iso(now),
+      // No charge is in flight after activation — leave the renewal-claim stamp
+      // clear so an immediate upgrade (claimForUpgrade) isn't blocked for ~50min.
+      last_charge_attempt_at: null,
       updated_at: iso(now),
     })
     .eq("user_id", i.userId);
@@ -410,7 +413,7 @@ export interface RecordPaymentInput {
   transactionGroupId?: number | string | null;
   cardSuffix?: string | null;
   cardBrand?: string | null;
-  kind: "subscribe" | "trial" | "renewal" | "refund" | "upgrade" | "storage_addon";
+  kind: "subscribe" | "trial" | "renewal" | "refund" | "upgrade" | "storage_addon" | "comp";
   status: "success" | "failed" | "rejected_amount" | "pending";
   errorText?: string | null;
 }
@@ -613,6 +616,69 @@ export async function grantStoragePurchase(userId: string, gb: number): Promise<
     p_gb: gb,
   });
   if (error) throw new Error(`grantStoragePurchase: ${error.message}`);
+}
+
+/**
+ * Admin comp: grant one free month. Extends the billing anchor by a month with
+ * NO charge, restores service (clears dunning / sets active), and records a ₪0
+ * 'comp' ledger row. amount:0 keeps it out of revenue & the promo-cycle count.
+ */
+export async function compFreeMonth(userId: string): Promise<{ ok: boolean; error?: string }> {
+  const { data: sub } = await supabaseAdmin
+    .from("subscriptions")
+    .select("plan, next_billing_at")
+    .eq("user_id", userId)
+    .maybeSingle();
+  if (!sub || !isPaidPlan(sub.plan as string)) return { ok: false, error: "not_paid" };
+
+  const now = new Date();
+  const base = sub.next_billing_at ? new Date(sub.next_billing_at as string) : now;
+  const anchor = base.getTime() > now.getTime() ? base : now;
+  const nextBilling = addMonths(anchor, 1);
+  const { error } = await supabaseAdmin
+    .from("subscriptions")
+    .update({
+      status: "active",
+      next_billing_at: iso(nextBilling),
+      expires_at: iso(addDays(nextBilling, GRACE_DAYS)),
+      failed_charge_count: 0,
+      dunning_status: null,
+      dunning_warned_at: null,
+      updated_at: iso(now),
+    })
+    .eq("user_id", userId);
+  if (error) throw new Error(`compFreeMonth: ${error.message}`);
+
+  await recordPayment({
+    userId,
+    plan: sub.plan as string,
+    amount: 0,
+    kind: "comp",
+    status: "success",
+    providerTxnId: `comp:${randomUUID()}`,
+  });
+  return { ok: true };
+}
+
+/** Token-free payment-method summary for the admin UI (NEVER returns the token). */
+export async function getPaymentMethodSummary(userId: string): Promise<{
+  cardSuffix: string | null;
+  cardBrand: string | null;
+  isValid: boolean;
+  chargeCount: number;
+} | null> {
+  const { data } = await supabaseAdmin
+    .from("payment_methods")
+    .select("card_suffix, card_brand, is_valid, charge_count")
+    .eq("user_id", userId)
+    .maybeSingle();
+  if (!data) return null;
+  return {
+    cardSuffix: data.card_suffix ?? null,
+    cardBrand: data.card_brand ?? null,
+    isValid: data.is_valid ?? false,
+    chargeCount: data.charge_count ?? 0,
+  };
 }
 
 /** Immediate downgrade to free after a cooling-off refund (access ends now). */

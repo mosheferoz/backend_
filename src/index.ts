@@ -8,6 +8,7 @@ import { logger } from "./lib/logger.js";
 import { checkoutRoute } from "./routes/checkout.js";
 import { webhooksRoute } from "./routes/webhooks.js";
 import { subscriptionRoute } from "./routes/subscription.js";
+import { adminRoute } from "./routes/admin.js";
 import { internalRoute } from "./routes/internal.js";
 import { startScheduler } from "./jobs/scheduler.js";
 
@@ -35,6 +36,7 @@ app.get("/", (c) => c.text("controlclick billing server"));
 app.route("/api/checkout", checkoutRoute);
 app.route("/webhook", webhooksRoute); // public Grow notify (registered with Grow)
 app.route("/api/subscription", subscriptionRoute);
+app.route("/api/admin", adminRoute);
 app.route("/internal", internalRoute);
 
 app.notFound((c) => c.json({ ok: false, error: "not_found" }, 404));

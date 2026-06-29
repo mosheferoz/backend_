@@ -241,45 +241,6 @@ subscriptionRoute.post("/update-card", async (c) => {
 });
 
 /**
- * 14-day cooling-off refund (consumer protection). Refunds the user's most
- * recent successful paid charge if it's within REFUND_WINDOW_DAYS and not
- * already refunded, then downgrades to free immediately. Charges made before
- * refund support shipped (no stored token) return not_refundable → support.
- */
-const REFUND_WINDOW_DAYS = 14;
-subscriptionRoute.post("/refund", async (c) => {
-  const user = c.get("user");
-  const charge = await billing.getRefundableCharge(user.id);
-  if (!charge) return c.json({ ok: false, error: "not_refundable" }, 409);
-
-  const ageDays = (Date.now() - new Date(charge.createdAt).getTime()) / DAY_MS;
-  if (ageDays > REFUND_WINDOW_DAYS) {
-    return c.json({ ok: false, error: "window_passed" }, 409);
-  }
-
-  const res = await grow.refundTransaction({
-    transactionId: charge.providerTxnId,
-    transactionToken: charge.providerTxnToken,
-    refundSum: charge.amount,
-    stopDirectDebit: true,
-  });
-  if (!isGrowSuccess(res)) {
-    logger.warn({ userId: user.id, err: res.err }, "refund_failed");
-    return c.json({ ok: false, error: "refund_failed" }, 502);
-  }
-
-  await billing.recordRefund({
-    userId: user.id,
-    plan: charge.plan,
-    amount: charge.amount,
-    refundedTxnId: charge.providerTxnId,
-  });
-  await billing.downgradeToFreeImmediate(user.id);
-  logger.info({ userId: user.id, amount: charge.amount }, "refund_completed");
-  return c.json({ ok: true, refundedAmount: charge.amount });
-});
-
-/**
  * One-time paid storage add-on (D2). Charges the saved card token for the
  * package price and, only on a verified success, grants the GB via a
  * service-role RPC. Requires a saved card (subscribe first to store one).

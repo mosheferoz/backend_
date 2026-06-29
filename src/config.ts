@@ -37,6 +37,8 @@ const EnvSchema = z.object({
   MAIL_FROM: z.string().optional(),
   // Where to send operational alerts (amount mismatch / fraud signal, etc.).
   ALERT_EMAIL: z.string().optional(),
+  // Comma-separated emails allowed to perform admin actions (e.g. refunds).
+  ADMIN_EMAILS: z.string().optional(),
 });
 
 const parsed = EnvSchema.safeParse(process.env);
@@ -105,6 +107,12 @@ export const config = {
   resendApiKey: env.RESEND_API_KEY ?? "",
   mailFrom: env.MAIL_FROM ?? "קונטרול בקליק <noreply@controlclick.co.il>",
   alertEmail: env.ALERT_EMAIL ?? "",
+
+  // Admin allowlist (lowercased). Overridable via ADMIN_EMAILS env.
+  adminEmails: (env.ADMIN_EMAILS ?? "office@controlclick.co.il,mosheferoz@gmail.com")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean),
 } as const;
 
 export type AppConfig = typeof config;

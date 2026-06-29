@@ -1,5 +1,6 @@
 import type { Context, Next } from "hono";
 import { supabaseAdmin } from "./supabaseAdmin.js";
+import { config } from "../config.js";
 
 export interface AuthedUser {
   id: string;
@@ -24,5 +25,21 @@ export async function requireAuth(c: Context<AppEnv>, next: Next) {
   }
 
   c.set("user", { id: data.user.id, email: data.user.email ?? undefined });
+  await next();
+}
+
+/** True if the email is in the admin allowlist (config.adminEmails). */
+export function isAdminEmail(email?: string | null): boolean {
+  return !!email && config.adminEmails.includes(email.toLowerCase());
+}
+
+/**
+ * Restrict to admin users (email allowlist). MUST run after requireAuth so the
+ * authenticated user is attached. Returns 403 for any non-admin.
+ */
+export async function requireAdmin(c: Context<AppEnv>, next: Next) {
+  if (!isAdminEmail(c.get("user")?.email)) {
+    return c.json({ ok: false, error: "forbidden" }, 403);
+  }
   await next();
 }
