@@ -52,13 +52,15 @@ if (!parsed.success) {
 
 const env = parsed.data;
 
-// Fail-fast on production misconfig that would otherwise silently degrade the
-// payment backend: running prod against the Meshulam sandbox, or with no API
-// key so every server-to-server verification quietly fails.
+// Fail-fast on production misconfig that would otherwise silently run the
+// payment backend against the Meshulam sandbox.
+// Note: apiKey is NOT required here. Per Grow docs it is needed only for
+// multi-business accounts ("לחברות בלבד"); a single business authenticates
+// with userId + pageCode. Server-to-server verification (getTransactionInfo /
+// getPaymentProcessInfo) authenticates with pageCode, so it works without it.
 if (env.NODE_ENV === "production") {
   const prodErrors: string[] = [];
   if (!env.MESHULAM_BASE) prodErrors.push("MESHULAM_BASE is required in production (no sandbox fallback)");
-  if (!env.MESHULAM_API_KEY) prodErrors.push("MESHULAM_API_KEY is required in production");
   if (prodErrors.length) {
     // eslint-disable-next-line no-console
     console.error("❌ Invalid production configuration:\n" + prodErrors.join("\n"));
