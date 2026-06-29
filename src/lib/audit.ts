@@ -9,7 +9,8 @@ export type AdminAction =
   | "comp_free_month"
   | "comp_storage"
   | "invalidate_card"
-  | "clear_dunning";
+  | "clear_dunning"
+  | "set_test";
 
 export interface AdminActionRecord {
   adminEmail: string;

@@ -78,6 +78,7 @@ function mapUserRow(r: Row) {
     lastPaymentAmount: num(r.last_payment_amount),
     cancelAtPeriodEnd: !!r.cancel_at_period_end,
     dunningStatus: str(r.dunning_status),
+    isTest: !!r.is_test,
   };
 }
 
@@ -193,6 +194,7 @@ adminRoute.get("/users/:userId", async (c) => {
       dunningStatus: str(row.dunning_status),
       cardSuffix: str(row.card_suffix),
       cardBrand: str(row.card_brand),
+      isTest: !!row.is_test,
     },
     paymentMethod: pm,
     ledger: (ledger ?? []).map((p) => ({
@@ -231,7 +233,7 @@ adminRoute.post("/users/:userId/resume", async (c) => {
 });
 
 const ChangePlanBody = z.object({
-  plan: z.enum(["premium", "pro"]),
+  plan: z.enum(["free", "premium", "pro"]),
   mode: z.enum(["immediate", "scheduled"]).default("immediate"),
 });
 adminRoute.post("/users/:userId/change-plan", async (c) => {
@@ -249,8 +251,17 @@ adminRoute.post("/users/:userId/change-plan", async (c) => {
   if (!sub) return c.json({ ok: false, error: "no_subscription" }, 404);
   const current = sub.plan as string;
 
+  // Manual downgrade to free (immediate, no charge, no dunning taint).
+  if (target === "free") {
+    if (current === "free") return c.json({ ok: true, effect: "noop" });
+    await billing.downgradeToFreeAdmin(userId);
+    await audit(c, "change_plan", userId, { from: current, to: "free", mode: "immediate", effect: "downgraded_free" });
+    return c.json({ ok: true, effect: "downgraded_free" });
+  }
+
+  const paid = target; // "premium" | "pro"
   let effect: string;
-  if (current === target) {
+  if (current === paid) {
     if (sub.pending_plan) {
       await billing.clearPendingPlan(userId);
       effect = "pending_cleared";
@@ -258,19 +269,23 @@ adminRoute.post("/users/:userId/change-plan", async (c) => {
       effect = "noop";
     }
   } else if (mode === "scheduled") {
-    await billing.schedulePlanChange(userId, target);
+    await billing.schedulePlanChange(userId, paid);
     effect = "scheduled_period_end";
   } else if (sub.status === "trialing") {
-    await billing.changePlanImmediate(userId, target);
+    await billing.changePlanImmediate(userId, paid);
     effect = "immediate_trial";
+  } else if (current === "free" || sub.status !== "active") {
+    // Manually turn a non-paying user into an active subscriber (no charge).
+    await billing.grantPaidPlanAdmin(userId, paid);
+    effect = "granted_no_charge";
   } else {
     // Immediate plan set WITHOUT a Grow charge (admin override); next renewal
     // bills the new plan. Anchor untouched.
-    await billing.applyUpgrade(userId, target);
+    await billing.applyUpgrade(userId, paid);
     effect = "immediate_no_charge";
   }
 
-  await audit(c, "change_plan", userId, { from: current, to: target, mode, effect });
+  await audit(c, "change_plan", userId, { from: current, to: paid, mode, effect });
   return c.json({ ok: true, effect });
 });
 
@@ -303,6 +318,25 @@ adminRoute.post("/users/:userId/comp", async (c) => {
   });
   await audit(c, "comp_storage", userId, { gb });
   return c.json({ ok: true, type: "storage_gb", gb });
+});
+
+const SetTestBody = z.object({ isTest: z.boolean() });
+adminRoute.post("/users/:userId/set-test", async (c) => {
+  const userId = paramUserId(c);
+  if (!userId) return c.json({ ok: false, error: "invalid_request" }, 400);
+  const body = SetTestBody.safeParse(await c.req.json().catch(() => null));
+  if (!body.success) return c.json({ ok: false, error: "invalid_request" }, 400);
+
+  const { error } = await supabaseAdmin
+    .from("subscriptions")
+    .update({ is_test: body.data.isTest })
+    .eq("user_id", userId);
+  if (error) {
+    logger.error({ err: error.message, userId }, "admin_set_test_failed");
+    return c.json({ ok: false, error: "set_test_failed" }, 500);
+  }
+  await audit(c, "set_test", userId, { isTest: body.data.isTest });
+  return c.json({ ok: true, isTest: body.data.isTest });
 });
 
 adminRoute.post("/users/:userId/invalidate-card", async (c) => {

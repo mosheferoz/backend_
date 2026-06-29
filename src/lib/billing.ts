@@ -701,6 +701,50 @@ export async function downgradeToFreeImmediate(userId: string): Promise<void> {
   if (error) throw new Error(`downgradeToFreeImmediate: ${error.message}`);
 }
 
+/**
+ * Admin manual downgrade to free — clean (no dunning taint, unlike the
+ * refund-driven downgradeToFreeImmediate). Clears all billing state.
+ */
+export async function downgradeToFreeAdmin(userId: string): Promise<void> {
+  const { error } = await supabaseAdmin
+    .from("subscriptions")
+    .update({
+      plan: "free",
+      status: "active",
+      expires_at: null,
+      next_billing_at: null,
+      trial_ends_at: null,
+      auto_renew: false,
+      cancel_at_period_end: false,
+      pending_plan: null,
+      dunning_status: null,
+      updated_at: iso(new Date()),
+    })
+    .eq("user_id", userId);
+  if (error) throw new Error(`downgradeToFreeAdmin: ${error.message}`);
+}
+
+/**
+ * Admin manual grant of a paid plan with NO charge — turns any user (free, etc.)
+ * into an active subscriber. Leaves no billing anchor (next_billing_at stays as
+ * is / null), so it's a comp-style grant, not a recurring paid subscription, and
+ * it won't be counted in "paying subscribers"/MRR (which require a real charge).
+ */
+export async function grantPaidPlanAdmin(userId: string, plan: PaidPlan): Promise<void> {
+  const { error } = await supabaseAdmin
+    .from("subscriptions")
+    .update({
+      plan,
+      status: "active",
+      cancel_at_period_end: false,
+      pending_plan: null,
+      dunning_status: null,
+      updated_at: iso(new Date()),
+    })
+    .eq("user_id", userId);
+  if (error) throw new Error(`grantPaidPlanAdmin: ${error.message}`);
+}
+
 export async function recordConsent(i: {
   userId: string;
   plan: string;
