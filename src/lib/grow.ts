@@ -219,7 +219,11 @@ export interface TokenChargeData {
 /** Charge a saved card token (renewal). Synchronous — no webhook is sent. */
 async function createTransactionWithToken(p: ChargeTokenParams) {
   return postForm<TokenChargeData>("createTransactionWithToken", {
-    ...auth(),
+    // Token charges authenticate with userId + apiKey only. Grow support
+    // confirmed pageCode is NOT needed here (it belongs to the hosted page /
+    // createPaymentProcess) — sending it is harmless but redundant.
+    userId: config.meshulam.userId,
+    apiKey: config.meshulam.apiKey || undefined,
     cardToken: p.cardToken,
     sum: p.sum,
     description: p.description,
