@@ -116,6 +116,9 @@ export async function activatePaidSubscription(i: {
   sum: number;
   cardSuffix?: string | null;
   cardBrand?: string | null;
+  /** Set when a coupon discounted this charge — links it so future renewals
+   *  (and this email/price displays) can find and keep applying it. */
+  couponRedemptionId?: string | null;
 }): Promise<void> {
   const now = new Date();
   const nextBilling = addMonths(now, 1);
@@ -139,6 +142,7 @@ export async function activatePaidSubscription(i: {
       last_payment_amount: i.sum,
       card_suffix: i.cardSuffix ?? null,
       card_brand: i.cardBrand ?? null,
+      coupon_redemption_id: i.couponRedemptionId ?? null,
       // No charge is in flight after activation — leave the renewal-claim stamp
       // clear so an immediate upgrade (claimForUpgrade) isn't blocked for ~50min.
       last_charge_attempt_at: null,
@@ -257,8 +261,16 @@ export async function claimForUpgrade(userId: string): Promise<boolean> {
   return !!data;
 }
 
-/** Start the free trial (save-token-only flow). No charge. */
-export async function startTrial(userId: string, plan: PaidPlan): Promise<void> {
+/**
+ * Start the free trial (save-token-only flow). No charge. `couponRedemptionId`,
+ * if given, is honored at the REAL first charge — trial-conversion runs
+ * through the same renewal job as every other monthly charge (see renew.ts).
+ */
+export async function startTrial(
+  userId: string,
+  plan: PaidPlan,
+  couponRedemptionId?: string | null,
+): Promise<void> {
   const now = new Date();
   const trialEnds = addDays(now, TRIAL_DAYS);
   const { error } = await supabaseAdmin
@@ -274,6 +286,7 @@ export async function startTrial(userId: string, plan: PaidPlan): Promise<void> 
       cancel_at_period_end: false,
       failed_charge_count: 0,
       dunning_status: null,
+      coupon_redemption_id: couponRedemptionId ?? null,
       updated_at: iso(now),
     })
     .eq("user_id", userId);
@@ -344,6 +357,9 @@ export async function expireOverdueSubscriptions(): Promise<number> {
     cancel_at_period_end: false,
     // Drop any scheduled downgrade so it can't resurface after a re-subscribe.
     pending_plan: null,
+    // A lapsed coupon shouldn't silently carry over if this user is later
+    // re-activated by some other path; a fresh checkout sets its own FK anyway.
+    coupon_redemption_id: null,
     dunning_status: "downgraded",
     updated_at: nowIso,
   };
@@ -694,6 +710,7 @@ export async function downgradeToFreeImmediate(userId: string): Promise<void> {
       auto_renew: false,
       cancel_at_period_end: false,
       pending_plan: null,
+      coupon_redemption_id: null,
       dunning_status: "refunded",
       updated_at: iso(new Date()),
     })
@@ -717,6 +734,7 @@ export async function downgradeToFreeAdmin(userId: string): Promise<void> {
       auto_renew: false,
       cancel_at_period_end: false,
       pending_plan: null,
+      coupon_redemption_id: null,
       dunning_status: null,
       updated_at: iso(new Date()),
     })
@@ -773,6 +791,8 @@ export interface DueSubscription {
   pendingPlan: PaidPlan | null;
   cardSuffix: string | null;
   billingGroupId: number;
+  /** Active coupon redemption to discount this renewal by, if any. */
+  couponRedemptionId: string | null;
 }
 
 /**
@@ -790,6 +810,7 @@ export async function claimDueSubscriptions(limit: number): Promise<DueSubscript
     pendingPlan: (r.pending_plan as PaidPlan | null) ?? null,
     cardSuffix: (r.card_suffix as string | null) ?? null,
     billingGroupId: Number(r.billing_group_id),
+    couponRedemptionId: (r.coupon_redemption_id as string | null) ?? null,
   }));
 }
 

@@ -1,5 +1,14 @@
 import { describe, it, expect } from "vitest";
-import { isPaidPlan, priceFor, amountMatches, prorationDelta, PROMO_CHARGES } from "./plans";
+import {
+  isPaidPlan,
+  priceFor,
+  amountMatches,
+  prorationDelta,
+  applyDiscount,
+  expectedChargeFor,
+  MIN_CHARGE_AMOUNT,
+  PROMO_CHARGES,
+} from "./plans";
 
 describe("plans", () => {
   it("identifies paid plans", () => {
@@ -54,6 +63,59 @@ describe("plans", () => {
     expect(amountMatches("pro", 249, 1)).toBe(false);
     expect(amountMatches("premium", 57.82, 1)).toBe(false); // 49 + 18% VAT on top
     expect(amountMatches("pro", 116.82, 1)).toBe(false); // 99 + 18% VAT on top
+  });
+
+  describe("applyDiscount / expectedChargeFor (coupons)", () => {
+    it("passes the base price through unchanged with no discount", () => {
+      expect(applyDiscount(49)).toBe(49);
+      expect(applyDiscount(49, null)).toBe(49);
+      expect(applyDiscount(49, undefined)).toBe(49);
+    });
+
+    it("applies a percent discount", () => {
+      expect(applyDiscount(49, { discountType: "percent", discountValue: 20 })).toBe(39.2);
+      expect(applyDiscount(100, { discountType: "percent", discountValue: 50 })).toBe(50);
+    });
+
+    it("applies a fixed-amount discount", () => {
+      expect(applyDiscount(49, { discountType: "fixed", discountValue: 10 })).toBe(39);
+    });
+
+    it("clamps to MIN_CHARGE_AMOUNT — never 0 or negative", () => {
+      expect(applyDiscount(49, { discountType: "percent", discountValue: 100 })).toBe(MIN_CHARGE_AMOUNT);
+      expect(applyDiscount(49, { discountType: "fixed", discountValue: 1000 })).toBe(MIN_CHARGE_AMOUNT);
+    });
+
+    it("never returns more than the base price", () => {
+      // A pathological/negative-value discount should not be able to inflate the charge.
+      expect(applyDiscount(49, { discountType: "fixed", discountValue: -10 })).toBeLessThanOrEqual(49);
+    });
+
+    it("expectedChargeFor composes priceFor with the discount", () => {
+      expect(expectedChargeFor("pro", 1, { discountType: "percent", discountValue: 10 })).toBe(89.1);
+      expect(expectedChargeFor("pro", 4, { discountType: "percent", discountValue: 10 })).toBe(224.1);
+      expect(expectedChargeFor("pro", 1)).toBe(priceFor("pro", 1));
+    });
+  });
+
+  describe("amountMatches with a coupon discount", () => {
+    it("requires the discounted amount, not the full price", () => {
+      const discount = { discountType: "percent" as const, discountValue: 20 };
+      expect(amountMatches("premium", 39.2, 1, discount)).toBe(true);
+      // The undiscounted promo price must now FAIL — proves a stale/spoofed
+      // full-price payload can't sneak a discounted redemption through.
+      expect(amountMatches("premium", 49, 1, discount)).toBe(false);
+    });
+
+    it("respects the MIN_CHARGE_AMOUNT floor for a large discount", () => {
+      const discount = { discountType: "percent" as const, discountValue: 100 };
+      expect(amountMatches("premium", MIN_CHARGE_AMOUNT, 1, discount)).toBe(true);
+    });
+
+    it("omitting the discount reproduces the no-coupon behavior exactly", () => {
+      expect(amountMatches("pro", 99, 1)).toBe(amountMatches("pro", 99, 1, null));
+      expect(amountMatches("pro", 49, 1)).toBe(amountMatches("pro", 49, 1, undefined));
+    });
   });
 
   describe("prorationDelta", () => {

@@ -5,6 +5,7 @@ import { requireAuth, requireAdmin, isAdminEmail, type AppEnv } from "../lib/aut
 import { rateLimit } from "../lib/rateLimit.js";
 import { grow, isGrowSuccess } from "../lib/grow.js";
 import * as billing from "../lib/billing.js";
+import * as coupons from "../lib/coupons.js";
 import { supabaseAdmin } from "../lib/supabaseAdmin.js";
 import { recordAdminAction, type AdminAction } from "../lib/audit.js";
 import { logger } from "../lib/logger.js";
@@ -45,7 +46,7 @@ function reqMeta(c: Context<AppEnv>) {
 async function audit(
   c: Context<AppEnv>,
   action: AdminAction,
-  targetUserId: string,
+  targetUserId: string | null,
   details?: Record<string, unknown>,
 ) {
   const u = c.get("user");
@@ -353,6 +354,96 @@ adminRoute.post("/users/:userId/clear-dunning", async (c) => {
   await billing.clearDunningOnCardUpdate(userId);
   await audit(c, "clear_dunning", userId);
   return c.json({ ok: true });
+});
+
+// --- coupons -----------------------------------------------------------
+const CouponPlan = z.enum(["premium", "pro"]);
+const CouponFieldsBase = z.object({
+  code: z.string().trim().min(3).max(40),
+  description: z.string().trim().max(500).nullable().optional(),
+  discountType: z.enum(["percent", "fixed"]),
+  discountValue: z.number().positive(),
+  applicablePlans: z.array(CouponPlan).min(1).max(2).nullable().optional(),
+  durationType: z.enum(["once", "repeating", "forever"]),
+  durationCycles: z.number().int().positive().nullable().optional(),
+  maxRedemptions: z.number().int().positive().nullable().optional(),
+  perUserLimit: z.number().int().positive().default(1),
+  active: z.boolean().default(true),
+  startsAt: z.string().nullable().optional(),
+  expiresAt: z.string().nullable().optional(),
+});
+// Cross-field business rules only make sense when every field is present, so
+// they're enforced on create; a PATCH that produces an inconsistent row (e.g.
+// durationType='repeating' with no durationCycles) still gets caught, just by
+// the DB's own CHECK constraints instead of a friendlier 400 — acceptable for
+// an admin-only tool with no untrusted end-user input.
+const CreateCouponBody = CouponFieldsBase.refine(
+  (b) => b.discountType !== "percent" || b.discountValue <= 100,
+  { message: "percent discount must be between 1 and 100", path: ["discountValue"] },
+).refine(
+  (b) => b.durationType !== "repeating" || b.durationCycles != null,
+  { message: "durationCycles is required when durationType is repeating", path: ["durationCycles"] },
+);
+const UpdateCouponBody = CouponFieldsBase.partial();
+
+adminRoute.get("/coupons", async (c) => {
+  try {
+    const rows = await coupons.listCoupons();
+    return c.json({ ok: true, coupons: rows });
+  } catch (e) {
+    logger.error({ err: String(e) }, "admin_coupons_list_failed");
+    return c.json({ ok: false, error: "coupons_failed" }, 500);
+  }
+});
+
+adminRoute.post("/coupons", async (c) => {
+  const body = CreateCouponBody.safeParse(await c.req.json().catch(() => null));
+  if (!body.success) return c.json({ ok: false, error: "invalid_request" }, 400);
+  const u = c.get("user");
+  try {
+    const coupon = await coupons.createCoupon(
+      { ...body.data, applicablePlans: body.data.applicablePlans ?? null },
+      u.email ?? "unknown",
+    );
+    await audit(c, "create_coupon", null, { couponId: coupon.id, code: coupon.code });
+    return c.json({ ok: true, coupon });
+  } catch (e) {
+    const msg = String(e);
+    const duplicate = msg.includes("duplicate key") || msg.includes("uq_coupon_codes_code");
+    if (!duplicate) logger.error({ err: msg }, "admin_coupon_create_failed");
+    return c.json({ ok: false, error: duplicate ? "code_taken" : "create_failed" }, duplicate ? 409 : 500);
+  }
+});
+
+adminRoute.patch("/coupons/:id", async (c) => {
+  const parsed = UUID.safeParse(c.req.param("id"));
+  if (!parsed.success) return c.json({ ok: false, error: "invalid_request" }, 400);
+  const body = UpdateCouponBody.safeParse(await c.req.json().catch(() => null));
+  if (!body.success) return c.json({ ok: false, error: "invalid_request" }, 400);
+  try {
+    const coupon = await coupons.updateCoupon(parsed.data, body.data);
+    await audit(c, "update_coupon", null, { couponId: coupon.id, patch: body.data });
+    return c.json({ ok: true, coupon });
+  } catch (e) {
+    logger.error({ err: String(e) }, "admin_coupon_update_failed");
+    return c.json({ ok: false, error: "update_failed" }, 500);
+  }
+});
+
+adminRoute.post("/coupons/:id/activate", async (c) => {
+  const parsed = UUID.safeParse(c.req.param("id"));
+  if (!parsed.success) return c.json({ ok: false, error: "invalid_request" }, 400);
+  const coupon = await coupons.setCouponActive(parsed.data, true);
+  await audit(c, "update_coupon", null, { couponId: coupon.id, field: "active", to: true });
+  return c.json({ ok: true, coupon });
+});
+
+adminRoute.post("/coupons/:id/deactivate", async (c) => {
+  const parsed = UUID.safeParse(c.req.param("id"));
+  if (!parsed.success) return c.json({ ok: false, error: "invalid_request" }, 400);
+  const coupon = await coupons.setCouponActive(parsed.data, false);
+  await audit(c, "update_coupon", null, { couponId: coupon.id, field: "active", to: false });
+  return c.json({ ok: true, coupon });
 });
 
 // --- refund (shared by both routes) ---------------------------------------

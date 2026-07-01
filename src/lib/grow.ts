@@ -140,6 +140,7 @@ export interface CreatePaymentProcessParams {
   cField1?: string; // userId
   cField2?: string; // plan
   cField3?: string; // mode (subscribe|trial)
+  cField4?: string; // coupon redemption id, if a coupon was applied
   invoiceName?: string;
   invoiceLicenseNumber?: string;
 }
@@ -181,6 +182,7 @@ async function createPaymentProcess(p: CreatePaymentProcessParams) {
     cField1: p.cField1,
     cField2: p.cField2,
     cField3: p.cField3,
+    cField4: p.cField4,
   });
 }
 

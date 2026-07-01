@@ -57,23 +57,63 @@ export function priceFor(plan: PaidPlan, cycleNumber = 1): number {
   return cycleNumber <= PROMO_CHARGES ? p.promo : p.regular;
 }
 
+/** Coupon terms as frozen on a coupon_redemptions row (see coupons.ts). */
+export interface DiscountSnapshot {
+  discountType: "percent" | "fixed";
+  discountValue: number;
+}
+
+/** Floor for any discounted charge — Grow rejects sum<=0 (the trial flow's
+ *  ₪1 token-save placeholder, below, exists to work around the same limit). */
+export const MIN_CHARGE_AMOUNT = 5;
+
+/**
+ * Apply a coupon (if any) to a base price. Never returns more than `base`
+ * (a coupon can only reduce a price) and never less than MIN_CHARGE_AMOUNT
+ * (a 100%-off or oversized fixed coupon clamps to the floor, not to 0/negative).
+ */
+export function applyDiscount(base: number, discount?: DiscountSnapshot | null): number {
+  if (!discount) return base;
+  const raw =
+    discount.discountType === "percent"
+      ? base * (1 - discount.discountValue / 100)
+      : base - discount.discountValue;
+  return round2(Math.max(MIN_CHARGE_AMOUNT, Math.min(raw, base)));
+}
+
+/** priceFor() with an optional coupon applied — the single source of truth for
+ *  "what should this charge actually be", used by checkout, renewals, and the
+ *  trial-reminder email alike. */
+export function expectedChargeFor(
+  plan: PaidPlan,
+  cycleNumber: number,
+  discount?: DiscountSnapshot | null,
+): number {
+  return applyDiscount(priceFor(plan, cycleNumber), discount);
+}
+
 /**
  * Anti-tampering check: the charged amount must be at least the expected price
  * for the given cycle (small tolerance for rounding). Defends against a
- * spoofed/low webhook amount.
+ * spoofed/low webhook amount. `discount`, when passed, MUST come from
+ * server-side state (a confirmed coupon_redemptions row) — never from anything
+ * the client or the webhook payload claims — otherwise this check stops
+ * defending against anything.
  */
 export function amountMatches(
   plan: PaidPlan,
   sum: number | null | undefined,
   cycleNumber = 1,
+  discount?: DiscountSnapshot | null,
 ): boolean {
   if (sum == null || Number.isNaN(sum)) return false;
-  const expected = priceFor(plan, cycleNumber);
+  const expected = expectedChargeFor(plan, cycleNumber, discount);
   // Both bounds are anchored to the price expected for THIS cycle (promo in the
-  // promo window, regular afterwards), with ₪0.5 rounding tolerance. Lower bound:
-  // anti-tampering (no spoofed undercharge). Upper bound: catch a silent
-  // overcharge — including the full/VAT-inflated price wrongly applied DURING the
-  // promo window (a cycle-independent ceiling would have let ₪149 pass at cycle 1).
+  // promo window, regular afterwards, discounted if a coupon applies), with
+  // ₪0.5 rounding tolerance. Lower bound: anti-tampering (no spoofed
+  // undercharge). Upper bound: catch a silent overcharge — including the
+  // full/VAT-inflated price wrongly applied DURING the promo window (a
+  // cycle-independent ceiling would have let ₪149 pass at cycle 1).
   return sum >= expected - 0.5 && sum <= expected + 0.5;
 }
 

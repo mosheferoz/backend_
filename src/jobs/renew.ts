@@ -1,6 +1,7 @@
 import { grow, isGrowSuccess, isDuplicateUniqueId, tokenQueryIndicatesPaid } from "../lib/grow.js";
 import * as billing from "../lib/billing.js";
-import { priceFor, PLAN_LABELS, MAX_TOKEN_CHARGES } from "../lib/plans.js";
+import { expectedChargeFor, PLAN_LABELS, MAX_TOKEN_CHARGES } from "../lib/plans.js";
+import { getActiveDiscount, applyCouponCycle } from "../lib/coupons.js";
 import { growInvoiceNotifyUrl } from "../lib/urls.js";
 import { logger } from "../lib/logger.js";
 
@@ -52,9 +53,13 @@ export async function runRenewals(): Promise<RenewalSummary> {
       const effectivePlan = sub.pendingPlan ?? sub.plan;
       const planSwitch = sub.pendingPlan && sub.pendingPlan !== sub.plan ? sub.pendingPlan : undefined;
 
-      // Promo price for the first 3 paid charges, regular from the 4th.
+      // Promo price for the first 3 paid charges, regular from the 4th —
+      // discounted further if a coupon is still active on this subscription.
+      // This is also where a TRIALING user's real first charge is priced: a
+      // coupon redeemed at trial-signup only gets consumed here, not earlier.
       const cycle = await billing.nextChargeCycle(sub.userId);
-      const amount = priceFor(effectivePlan, cycle);
+      const discount = await getActiveDiscount(sub.couponRedemptionId);
+      const amount = expectedChargeFor(effectivePlan, cycle, discount);
       uniqueId = await billing.nextUniqueId();
       const contact = await billing.getProfileBillingContact(sub.userId);
 
@@ -90,6 +95,7 @@ export async function runRenewals(): Promise<RenewalSummary> {
         const dd = (res.data ?? {}) as Record<string, unknown>;
         await billing.renewSubscription(sub.userId, amount, planSwitch);
         await billing.incrementChargeCount(sub.userId);
+        if (discount && sub.couponRedemptionId) await applyCouponCycle(sub.couponRedemptionId);
         await billing.finalizePayment(uniqueId, {
           status: "success",
           providerTxnId: dd.transactionId ? String(dd.transactionId) : null,
@@ -107,6 +113,7 @@ export async function runRenewals(): Promise<RenewalSummary> {
         if (tokenQueryIndicatesPaid(q)) {
           await billing.renewSubscription(sub.userId, amount, planSwitch);
           await billing.incrementChargeCount(sub.userId);
+          if (discount && sub.couponRedemptionId) await applyCouponCycle(sub.couponRedemptionId);
           await billing.finalizePayment(uniqueId, { status: "success" });
           succeeded++;
         } else {

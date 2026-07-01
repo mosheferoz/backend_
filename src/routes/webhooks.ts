@@ -3,6 +3,7 @@ import { config } from "../config.js";
 import { grow } from "../lib/grow.js";
 import { isPaidPlan, amountMatches, type PaidPlan } from "../lib/plans.js";
 import * as billing from "../lib/billing.js";
+import { confirmRedemption, applyCouponCycle } from "../lib/coupons.js";
 import { extractInvoiceRef } from "../lib/invoices.js";
 import { rateLimit } from "../lib/rateLimit.js";
 import { safeEqual } from "../lib/crypto.js";
@@ -78,6 +79,7 @@ webhooksRoute.post("/", async (c) => {
   const userId = pick(cf, ["cField1"]) ?? pick(d, ["cField1"]) ?? pick(payload, ["cField1"]);
   const plan = pick(cf, ["cField2"]) ?? pick(d, ["cField2"]) ?? pick(payload, ["cField2"]);
   const mode = pick(cf, ["cField3"]) ?? pick(d, ["cField3"]) ?? pick(payload, ["cField3"]);
+  const redemptionId = pick(cf, ["cField4"]) ?? pick(d, ["cField4"]) ?? pick(payload, ["cField4"]);
 
   const transactionId = pick(d, ["transactionId", "transactionCode"]) ?? pick(payload, ["transactionId"]);
   const transactionToken = pick(d, ["transactionToken"]) ?? pick(payload, ["transactionToken"]);
@@ -135,7 +137,11 @@ webhooksRoute.post("/", async (c) => {
       phone: payerPhone,
       email: payerEmail,
     });
-    await billing.startTrial(userId, plan as PaidPlan);
+    // No charge happens here, so there's nothing to validate a coupon amount
+    // against yet — just confirm the reservation and attach it to the trial so
+    // the renewal job can find and apply it at the real trial-conversion charge.
+    const trialDiscount = redemptionId ? await confirmRedemption(redemptionId, userId) : null;
+    await billing.startTrial(userId, plan as PaidPlan, trialDiscount ? redemptionId : null);
     await billing.recordPayment({
       userId,
       plan,
@@ -157,9 +163,17 @@ webhooksRoute.post("/", async (c) => {
   // amount (e.g. VAT added on top) for the user's current cycle. ---
   const verifiedSum = Number(pick(d, ["sum", "paymentSum"]));
 
-  // Validate against the price for this user's current cycle (promo vs regular).
+  // Resolve any coupon BEFORE validating the amount — confirmRedemption is
+  // scoped to this userId, so a spoofed/mismatched cField4 just yields no
+  // discount (full price required) rather than granting someone else's
+  // coupon. A broken redemption reference can only make this check stricter,
+  // never looser.
+  const discount = redemptionId ? await confirmRedemption(redemptionId, userId) : null;
+
+  // Validate against the price for this user's current cycle (promo vs
+  // regular, discounted if a coupon applies).
   const cycle = await billing.nextChargeCycle(userId);
-  if (!amountMatches(plan as PaidPlan, verifiedSum, cycle)) {
+  if (!amountMatches(plan as PaidPlan, verifiedSum, cycle, discount)) {
     await billing.recordPayment({
       userId,
       plan,
@@ -194,7 +208,9 @@ webhooksRoute.post("/", async (c) => {
     sum: verifiedSum,
     cardSuffix,
     cardBrand,
+    couponRedemptionId: discount ? redemptionId : null,
   });
+  if (discount && redemptionId) await applyCouponCycle(redemptionId);
   await billing.recordPayment({
     userId,
     plan,

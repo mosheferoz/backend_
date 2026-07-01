@@ -10,13 +10,17 @@ export type AdminAction =
   | "comp_storage"
   | "invalidate_card"
   | "clear_dunning"
-  | "set_test";
+  | "set_test"
+  | "create_coupon"
+  | "update_coupon";
 
 export interface AdminActionRecord {
   adminEmail: string;
   adminUserId?: string | null;
   action: AdminAction;
-  targetUserId: string;
+  /** Null for actions with no single target user (e.g. coupon management —
+   *  put the coupon id in `details` instead). */
+  targetUserId: string | null;
   details?: Record<string, unknown>;
   ip?: string | null;
   userAgent?: string | null;

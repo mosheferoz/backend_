@@ -1,6 +1,7 @@
 import { grow, tokenQueryIndicatesPaid, isGrowSuccess } from "../lib/grow.js";
 import * as billing from "../lib/billing.js";
 import { priceFor, type PaidPlan } from "../lib/plans.js";
+import { applyCouponCycle } from "../lib/coupons.js";
 import { supabaseAdmin } from "../lib/supabaseAdmin.js";
 import { logger } from "../lib/logger.js";
 
@@ -81,6 +82,22 @@ async function reconcileInner(): Promise<ReconcileSummary> {
         } else {
           // Renewal: extend the period; `plan` carries any scheduled downgrade.
           await billing.renewSubscription(userId, amount, plan);
+          // A discounted renewal that only got confirmed here (network
+          // timeout, resolved 10+ min later) still needs its coupon cycle
+          // bookkeeping — renew.ts's own applyCouponCycle call never ran for
+          // this attempt. Re-read the FK fresh rather than threading it
+          // through subscription_payments; nothing else can change it for an
+          // in-flight-renewal subscriber in the meantime (the claim window in
+          // claim_due_subscriptions and checkout.ts's already_subscribed guard
+          // both block a concurrent second write to it).
+          const { data: subRow } = await supabaseAdmin
+            .from("subscriptions")
+            .select("coupon_redemption_id")
+            .eq("user_id", userId)
+            .maybeSingle();
+          if (subRow?.coupon_redemption_id) {
+            await applyCouponCycle(subRow.coupon_redemption_id as string);
+          }
         }
         await billing.incrementChargeCount(userId);
         await billing.finalizePayment(uniqueId, { status: "success" });

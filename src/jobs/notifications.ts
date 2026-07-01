@@ -1,7 +1,8 @@
 import { supabaseAdmin } from "../lib/supabaseAdmin.js";
 import { sendEmail, trialReminderHtml } from "../lib/mail.js";
 import * as billing from "../lib/billing.js";
-import { priceFor, PLAN_LABELS, isPaidPlan } from "../lib/plans.js";
+import { expectedChargeFor, PLAN_LABELS, isPaidPlan } from "../lib/plans.js";
+import { getActiveDiscount } from "../lib/coupons.js";
 import { logger } from "../lib/logger.js";
 
 const DAY_MS = 86_400_000;
@@ -17,7 +18,7 @@ export async function runTrialReminders(): Promise<number> {
   const soon = new Date(now.getTime() + 2 * DAY_MS);
   const { data, error } = await supabaseAdmin
     .from("subscriptions")
-    .select("user_id, plan, trial_ends_at")
+    .select("user_id, plan, trial_ends_at, coupon_redemption_id")
     .eq("status", "trialing")
     .is("trial_reminder_sent_at", null)
     .gt("trial_ends_at", now.toISOString())
@@ -36,7 +37,8 @@ export async function runTrialReminders(): Promise<number> {
     if (!contact.email) continue;
 
     const cycle = await billing.nextChargeCycle(s.user_id as string);
-    const priceHe = `₪${priceFor(plan, cycle)} לחודש`;
+    const discount = await getActiveDiscount(s.coupon_redemption_id as string | null);
+    const priceHe = `₪${expectedChargeFor(plan, cycle, discount)} לחודש`;
     const endHe = new Date(s.trial_ends_at as string).toLocaleDateString("he-IL");
 
     const ok = await sendEmail(
